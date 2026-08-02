@@ -150,8 +150,6 @@ def compress_norm_rope_store_triton(
         kv_cache,
         k_cache_metadata.slot_mapping,
         kv_cache.shape[1],  # paged KV cache block size (tokens per block)
-        kv_block_table,
-        kv_block_table_stride,
         # constexprs
         HEAD_SIZE=head_dim,
         TRITON_BLOCK_SIZE=triton.next_power_of_2(head_dim),
@@ -167,6 +165,8 @@ def compress_norm_rope_store_triton(
         DCP_WORLD_SIZE=dcp_world_size,
         DCP_RANK=dcp_rank,
         DCP_ENTRY_INTERLEAVE=dcp_entry_interleave,
+        kv_block_table_ptr=kv_block_table,
+        kv_block_table_stride=kv_block_table_stride,
         num_warps=num_warps,
         **pdl_kwargs,
     )
@@ -198,8 +198,6 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     k_cache_ptr,
     kv_slot_mapping_ptr,
     kv_cache_block_size,
-    kv_block_table_ptr,
-    kv_block_table_stride,
     # ── constexprs ──
     HEAD_SIZE: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
@@ -215,6 +213,12 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     DCP_WORLD_SIZE: tl.constexpr = 1,
     DCP_RANK: tl.constexpr = 0,
     DCP_ENTRY_INTERLEAVE: tl.constexpr = 1,
+    # Trailing defaulted runtime params so pre-existing direct kernel calls
+    # (e.g. tests/kernels/test_compressor_kv_cache.py) that predate DCP keep
+    # working; only read when DCP_WORLD_SIZE > 1 (dead code under the
+    # default constexpr specialization).
+    kv_block_table_ptr=None,
+    kv_block_table_stride=0,
 ):
     """Fused compress → RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope).
 
@@ -786,8 +790,6 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     k_cache_ptr,
     kv_slot_mapping_ptr,
     kv_cache_block_size,
-    kv_block_table_ptr,  # unused (indexer writes via kv_slot_mapping)
-    kv_block_table_stride,  # unused
     # ── constexprs ──
     HEAD_SIZE: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
@@ -803,6 +805,10 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     DCP_WORLD_SIZE: tl.constexpr = 1,
     DCP_RANK: tl.constexpr = 0,
     DCP_ENTRY_INTERLEAVE: tl.constexpr = 1,
+    # Trailing defaulted runtime params (signature parity with the shared
+    # launcher; unused here — indexer writes via kv_slot_mapping).
+    kv_block_table_ptr=None,
+    kv_block_table_stride=0,
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
 
@@ -983,8 +989,6 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     k_cache_ptr,
     kv_slot_mapping_ptr,
     kv_cache_block_size,
-    kv_block_table_ptr,  # unused (signature parity with the shared launcher)
-    kv_block_table_stride,  # unused
     # ── constexprs ──
     HEAD_SIZE: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
@@ -1002,6 +1006,10 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     DCP_WORLD_SIZE: tl.constexpr = 1,
     DCP_RANK: tl.constexpr = 0,
     DCP_ENTRY_INTERLEAVE: tl.constexpr = 1,
+    # Trailing defaulted runtime params (signature parity with the shared
+    # launcher; unused here).
+    kv_block_table_ptr=None,
+    kv_block_table_stride=0,
 ):
     """Fused compress → RMSNorm → RoPE → MXFP4 quant → store.
 

@@ -222,6 +222,19 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
                 "graph capture for attention (enforce_eager / cudagraph "
                 "mode NONE)."
             )
+        if self.compress_ratio != 4:
+            # Fail closed (review B/D, round 2): the C128A decode top-k
+            # metadata producer (sparse_mla.py builder + amd/rocm.py ragged
+            # copy) enumerates GLOBAL compressed-entry slots and has no DCP
+            # awareness yet — consuming them here as local-shard entries
+            # would compute silently wrong attention.  Mirrors the prefill
+            # guard above; lift once the builder emits rank-local entries
+            # via the shared ownership formulas (owner(e) = (e//I) % W).
+            raise NotImplementedError(
+                "VLLM_SM86_DCP: C128A (compress_ratio=128) decode is not "
+                "context-parallel on the SM8x path yet; sparse_mla.py's "
+                "top-k metadata builder must emit rank-local entries first."
+            )
         assert kv_cache is not None
         assert swa_metadata.is_valid_token is not None
         assert swa_metadata.decode_swa_indices is not None
