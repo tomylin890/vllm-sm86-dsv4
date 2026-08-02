@@ -57,6 +57,7 @@ class BlockTable:
         kernel_block_size: int,
         cp_kv_cache_interleave_size: int,
         slot_mapping_mode: SlotMappingMode = SlotMappingMode.TOKEN_TO_KV_SLOT,
+        shard_dcp: bool = True,
     ):
         """
         Args:
@@ -72,6 +73,11 @@ class BlockTable:
             slot_mapping_mode: How this cache group maps scheduled tokens to
                 cache slots. Mamba-like state caches do not use token slot
                 mappings and should use SlotMappingMode.NONE.
+            shard_dcp: Whether this group's KV is round-robin sharded across
+                DCP ranks. False only for dcp_exempt (replicated) groups
+                under VLLM_SM86_DCP (e.g. DeepseekV4 sliding-window KV and
+                fp32 compressor-state groups); the default True keeps the
+                original behavior.
         """
         self.max_num_reqs = max_num_reqs
         self.max_num_batched_tokens = max_num_batched_tokens
@@ -130,6 +136,13 @@ class BlockTable:
             self.dcp_rank = get_dcp_group().rank_in_group
         except AssertionError:
             # DCP might not be initialized in testing
+            self.dcp_world_size = 1
+            self.dcp_rank = 0
+        # DCP-exempt groups (e.g. DeepseekV4 sliding-window KV and fp32
+        # compressor-state groups under VLLM_SM86_DCP) stay REPLICATED across
+        # DCP ranks: force world=1/rank=0 so compute_slot_mapping stores every
+        # token locally instead of round-robin sharding it.
+        if not shard_dcp:
             self.dcp_world_size = 1
             self.dcp_rank = 0
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
@@ -281,6 +294,7 @@ class MultiGroupBlockTable:
         max_num_blocks: list[int],
         cp_kv_cache_interleave_size: int = 1,
         slot_mapping_modes: list[SlotMappingMode] | None = None,
+        dcp_exempt: list[bool] | None = None,
     ) -> None:
         if len(kernel_block_sizes) != len(block_sizes):
             raise ValueError(
@@ -292,6 +306,17 @@ class MultiGroupBlockTable:
         if len(slot_mapping_modes) != len(block_sizes):
             raise ValueError(
                 f"slot_mapping_modes length ({len(slot_mapping_modes)}) "
+                f"must match block_sizes length ({len(block_sizes)})"
+            )
+        # Per-group DCP exemption (VLLM_SM86_DCP): exempt groups are
+        # replicated across DCP ranks -- they keep full unsharded block
+        # tables and are not round-robin virtual-block mapped. The all-False
+        # default preserves the original behavior.
+        if dcp_exempt is None:
+            dcp_exempt = [False] * len(block_sizes)
+        if len(dcp_exempt) != len(block_sizes):
+            raise ValueError(
+                f"dcp_exempt length ({len(dcp_exempt)}) "
                 f"must match block_sizes length ({len(block_sizes)})"
             )
 
@@ -323,14 +348,20 @@ class MultiGroupBlockTable:
                 kernel_block_size,
                 cp_kv_cache_interleave_size,
                 slot_mapping_mode=slot_mapping_mode,
+                shard_dcp=not exempt,
             )
             for (
                 block_size,
                 kernel_block_size,
                 max_num_blocks_per_req,
                 slot_mapping_mode,
+                exempt,
             ) in zip(
-                block_sizes, kernel_block_sizes, max_num_blocks, slot_mapping_modes
+                block_sizes,
+                kernel_block_sizes,
+                max_num_blocks,
+                slot_mapping_modes,
+                dcp_exempt,
             )
         ]
 

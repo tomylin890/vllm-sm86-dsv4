@@ -701,6 +701,9 @@ class GPUModelRunner(
         self._init_kernel_block_sizes = [placeholder_block_size]
         self._init_max_num_blocks = [placeholder_max_num_blocks]
         self._init_slot_mapping_modes = [SlotMappingMode.TOKEN_TO_KV_SLOT]
+        # Per-group DCP exemption (VLLM_SM86_DCP); all-False unless the gate
+        # is set (see may_reinitialize_input_batch).
+        self._init_dcp_exempt = [False]
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
             # We need to use the encoder length for encoder-decoder
@@ -7246,6 +7249,19 @@ class GPUModelRunner(
         block_sizes = []
         max_num_blocks = []
         slot_mapping_modes = []
+        # Per-group DCP exemption (VLLM_SM86_DCP, DeepseekV4-sparse hybrid
+        # DCP): sliding-window groups cannot be round-robin sharded across
+        # DCP ranks (the window / fp32 compressor state would be split), so
+        # they stay REPLICATED and keep full unsharded block tables. This
+        # covers the SWA KV group and every compressor-state group
+        # (SlidingWindowMLASpec subclasses SlidingWindowSpec, including the
+        # indexer's own compressor state). Only the compressed-KV
+        # MLAAttentionSpec groups are sharded (ARCHITECTURE.md section 7);
+        # note the indexer key cache is an MLAAttentionSpec group with the
+        # same block_size as the main KV groups, so its round-robin shard is
+        # token-range aligned with the main KV shards. With the gate unset
+        # this list is all-False and behavior is unchanged.
+        dcp_exempt: list[bool] = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             kv_cache_spec = kv_cache_group.kv_cache_spec
@@ -7258,6 +7274,12 @@ class GPUModelRunner(
                 slot_mapping_modes.append(SlotMappingMode.NONE)
             else:
                 slot_mapping_modes.append(SlotMappingMode.TOKEN_TO_KV_SLOT)
+            dcp_exempt.append(
+                envs.VLLM_SM86_DCP and isinstance(kv_cache_spec, SlidingWindowSpec)
+            )
+            # For exempt groups SlidingWindowSpec.max_num_blocks_per_req
+            # returns full unsharded rows under the gate, matching the
+            # replicated (shard_dcp=False) block table below.
             max_num_blocks_per_req = kv_cache_spec.max_num_blocks_per_req(
                 self.vllm_config, max_model_len
             )
@@ -7268,11 +7290,13 @@ class GPUModelRunner(
             or kernel_block_sizes != self._init_kernel_block_sizes
             or max_num_blocks != self._init_max_num_blocks
             or slot_mapping_modes != self._init_slot_mapping_modes
+            or dcp_exempt != self._init_dcp_exempt
         ):
             self._init_block_sizes = block_sizes
             self._init_kernel_block_sizes = kernel_block_sizes
             self._init_max_num_blocks = max_num_blocks
             self._init_slot_mapping_modes = slot_mapping_modes
+            self._init_dcp_exempt = dcp_exempt
             self.input_batch = InputBatch(
                 max_num_reqs=self.max_num_reqs,
                 max_model_len=max_model_len,
@@ -7290,6 +7314,7 @@ class GPUModelRunner(
                 reasoning_config=self.vllm_config.reasoning_config,
                 use_replayssm=self.cache_config.use_replayssm,
                 slot_mapping_modes=slot_mapping_modes,
+                dcp_exempt=dcp_exempt,
             )
 
         assert self._init_block_sizes == block_sizes, (
