@@ -128,6 +128,267 @@ def _merge_dcp_topk_global(
     )
 
 
+# --------------------------------------------------------------------------
+# P2b (SM8x DSV4 DCP, gated by VLLM_SM86_DCP via
+# DeepseekV32IndexerMetadata.use_sm86_dcp_topk): pure-torch deterministic
+# global top-k for compressed-entry indexer shards. The CuteDSL merge above
+# is Hopper+-only; these helpers are its SM8x replacement and additionally
+# implement the explicit fp32 tie-break (lower global entry index wins)
+# required by ARCHITECTURE.md section 10 rule 4.
+#
+# Index spaces: "local" indices are this rank's compressed-entry positions
+# under the interleave-aware round-robin DCP layout
+# (owner(e) = (e // interleave) % world); "global" indices are absolute
+# compressed-entry positions. -1 is the invalid sentinel throughout.
+# --------------------------------------------------------------------------
+
+_SM86_DCP_INVALID_SCORE = float("-inf")
+
+
+def _sm86_dcp_local_to_global(
+    local_indices: torch.Tensor,
+    dcp_rank: int,
+    dcp_world_size: int,
+    cp_interleave: int,
+) -> torch.Tensor:
+    """Map rank-local compressed-entry indices to global entry indices.
+
+    Mirrors the Lasimeri ContextParallelLayout.local_to_global formula;
+    -1 passes through unchanged.
+    """
+    safe = torch.clamp(local_indices, min=0)
+    global_indices = (
+        (safe // cp_interleave) * (cp_interleave * dcp_world_size)
+        + dcp_rank * cp_interleave
+        + safe % cp_interleave
+    )
+    return torch.where(
+        local_indices >= 0,
+        global_indices,
+        torch.full_like(global_indices, -1),
+    )
+
+
+def _sm86_dcp_owns(
+    global_indices: torch.Tensor,
+    dcp_rank: int,
+    dcp_world_size: int,
+    cp_interleave: int,
+) -> torch.Tensor:
+    """True where this rank owns the global compressed-entry index (>= 0)."""
+    safe = torch.clamp(global_indices, min=0)
+    owner = (safe // cp_interleave) % dcp_world_size
+    return (global_indices >= 0) & (owner == dcp_rank)
+
+
+def _sm86_dcp_global_to_local(
+    global_indices: torch.Tensor,
+    dcp_rank: int,
+    dcp_world_size: int,
+    cp_interleave: int,
+) -> torch.Tensor:
+    """Map global entry indices to this rank's local indices.
+
+    Exact inverse of _sm86_dcp_local_to_global for indices this rank owns;
+    callers must mask non-owned entries (the formula returns the local
+    PREFIX COUNT for those, matching get_dcp_local_seq_lens semantics).
+    -1 passes through unchanged.
+    """
+    safe = torch.clamp(global_indices, min=0)
+    rank_stride = dcp_world_size * cp_interleave
+    base = safe // rank_stride * cp_interleave
+    remainder = safe - base * dcp_world_size
+    extra = torch.clamp(remainder - dcp_rank * cp_interleave, 0, cp_interleave)
+    return torch.where(
+        global_indices >= 0,
+        base + extra,
+        torch.full_like(global_indices, -1),
+    )
+
+
+def _sm86_dcp_global_topk(
+    local_values: torch.Tensor,
+    local_global_indices: torch.Tensor,
+    topk_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """All-gather fixed-width per-rank candidates and take the deterministic
+    global top-k.
+
+    Exactness: any entry in the true global top-k has fewer than topk_tokens
+    entries ranked above it globally, hence fewer than topk_tokens above it on
+    its own rank, so it appears in its owning rank's local top-k candidates --
+    merging only ``topk_tokens * dcp_world_size`` candidates is equivalent to
+    a topk over the full concatenated score row.
+
+    Determinism / tie-break (ARCHITECTURE.md section 10 rule 4): scores are
+    compared in fp32 and ties are broken by LOWER global entry index. Plain
+    torch.topk does not guarantee any tie order across different candidate
+    orderings, so this is implemented with two stable argsorts: first
+    ascending global index, then a stable descending sort on scores -- equal
+    scores retain ascending-index order. This is a documented deviation from
+    the Lasimeri reference (_dcp_global_topk used plain torch.topk); the
+    selected SET only differs from the reference when fp32 scores tie at the
+    top-k boundary. All ops are fixed-shape and sync-free (capture-safe); the
+    all-gather concatenates in fixed rank order.
+
+    Invalid candidates carry score -inf and index -1 on input; they are
+    remapped to index int32-max for the tie-break sort so that a genuine
+    candidate always wins, and any -inf survivor is masked back to -1.
+    """
+    dcp_group = get_dcp_group()
+    cand_values = dcp_group.all_gather(local_values.contiguous(), dim=1)
+    cand_indices = dcp_group.all_gather(local_global_indices.contiguous(), dim=1)
+    invalid = cand_indices < 0
+    cand_values = torch.where(
+        invalid,
+        torch.full_like(cand_values, _SM86_DCP_INVALID_SCORE),
+        cand_values,
+    )
+    sort_indices = torch.where(
+        invalid,
+        torch.full_like(cand_indices, torch.iinfo(torch.int32).max),
+        cand_indices,
+    )
+    idx_order = torch.argsort(sort_indices, dim=-1, stable=True)
+    values_by_idx = torch.gather(cand_values, -1, idx_order)
+    indices_by_idx = torch.gather(cand_indices, -1, idx_order)
+    score_order = torch.argsort(
+        values_by_idx, dim=-1, descending=True, stable=True
+    )[..., :topk_tokens]
+    top_values = torch.gather(values_by_idx, -1, score_order)
+    top_indices = torch.gather(indices_by_idx, -1, score_order)
+    top_indices = torch.where(
+        top_values == _SM86_DCP_INVALID_SCORE,
+        torch.full_like(top_indices, -1),
+        top_indices,
+    )
+    return top_values, top_indices
+
+
+def _sm86_dcp_topk_prefill(
+    logits: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    local_topk_indices: torch.Tensor,
+    topk_tokens: int,
+    dcp_rank: int,
+    dcp_world_size: int,
+    cp_interleave: int,
+    has_local_kv: bool,
+) -> torch.Tensor:
+    """Merge per-rank prefill local top-k into the global top-k.
+
+    ``local_topk_indices`` come from ops.top_k_per_row_prefill and are
+    relative to each row's band start ``cu_seqlen_ks`` -- under DCP the band
+    holds this rank's LOCAL compressed entries, so the relative index IS the
+    local entry index. Returns int32 GLOBAL entry indices padded with -1
+    (matching both the Lasimeri reference prefill convention and the base
+    _merge_dcp_topk_global output contract: the attention side localizes).
+    Every rank must call this for every chunk (chunk splits are derived from
+    global CPU seq lens, hence rank-invariant) so the all-gather stays
+    symmetric even when has_local_kv is False.
+    """
+    num_rows = local_topk_indices.shape[0]
+    if has_local_kv:
+        gather_indices = torch.clamp(local_topk_indices, min=0).to(torch.int64)
+        gather_indices = gather_indices + cu_seqlen_ks.to(torch.int64).unsqueeze(1)
+        gather_indices = torch.clamp(gather_indices, max=logits.shape[1] - 1)
+        gathered = torch.gather(logits, 1, gather_indices)
+        local_values = torch.where(
+            local_topk_indices >= 0,
+            gathered,
+            torch.full_like(gathered, _SM86_DCP_INVALID_SCORE),
+        )
+        local_indices = local_topk_indices
+    else:
+        # This rank holds no KV for this chunk: contribute all-invalid
+        # candidates so the collective stays aligned across ranks.
+        local_values = torch.full(
+            (num_rows, topk_tokens),
+            _SM86_DCP_INVALID_SCORE,
+            dtype=torch.float32,
+            device=local_topk_indices.device,
+        )
+        local_indices = torch.full(
+            (num_rows, topk_tokens),
+            -1,
+            dtype=torch.int32,
+            device=local_topk_indices.device,
+        )
+    global_candidates = _sm86_dcp_local_to_global(
+        local_indices, dcp_rank, dcp_world_size, cp_interleave
+    )
+    _, top_indices = _sm86_dcp_global_topk(
+        local_values, global_candidates, topk_tokens
+    )
+    return top_indices
+
+
+def _sm86_dcp_topk_decode(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    local_topk_indices: torch.Tensor,
+    topk_tokens: int,
+    dcp_rank: int,
+    dcp_world_size: int,
+    cp_interleave: int,
+) -> torch.Tensor:
+    """Merge per-rank decode local top-k into the global top-k, then keep only
+    this rank's owned entries as LOCAL indices (the P2 interface contract).
+
+    ``seq_lens`` are this rank's LOCAL compressed-entry counts (the metadata
+    builder localizes divide-then-shard); ``local_topk_indices`` come from the
+    local decode top-k kernels and index this rank's local entries. Output is
+    int32 (rows, topk_tokens): owned entries first, ordered by (score desc,
+    global index asc) via a stable compaction sort, padded with -1. Only the
+    ORDER of the owned prefix differs from the Lasimeri reference (which
+    compacted with plain torch.topk); the selected set is identical.
+    """
+    num_rows = local_topk_indices.shape[0]
+    local_lens = seq_lens.reshape(-1)[:num_rows]
+    valid = (local_topk_indices >= 0) & (
+        local_topk_indices < local_lens.unsqueeze(1)
+    )
+    safe_indices = torch.clamp(
+        local_topk_indices, min=0, max=max(logits.shape[1] - 1, 0)
+    ).to(torch.int64)
+    gathered = torch.gather(logits, 1, safe_indices)
+    local_values = torch.where(
+        valid,
+        gathered,
+        torch.full_like(gathered, _SM86_DCP_INVALID_SCORE),
+    )
+    masked_local = torch.where(
+        valid,
+        local_topk_indices,
+        torch.full_like(local_topk_indices, -1),
+    )
+    global_candidates = _sm86_dcp_local_to_global(
+        masked_local, dcp_rank, dcp_world_size, cp_interleave
+    )
+    global_values, global_indices = _sm86_dcp_global_topk(
+        local_values, global_candidates, topk_tokens
+    )
+    owned = _sm86_dcp_owns(global_indices, dcp_rank, dcp_world_size, cp_interleave)
+    owned_values = torch.where(
+        owned,
+        global_values,
+        torch.full_like(global_values, _SM86_DCP_INVALID_SCORE),
+    )
+    # Stable compaction: owned entries first, preserving the deterministic
+    # (score desc, global index asc) order from the global top-k.
+    owned_order = torch.argsort(owned_values, dim=-1, descending=True, stable=True)
+    owned_sorted = torch.gather(owned, -1, owned_order)
+    global_sorted = torch.gather(global_indices, -1, owned_order)
+    local_out = _sm86_dcp_global_to_local(
+        global_sorted, dcp_rank, dcp_world_size, cp_interleave
+    )
+    return torch.where(
+        owned_sorted,
+        local_out,
+        torch.full_like(local_out, -1),
+    )
+
+
 @triton.jit
 def _fused_indexer_q_rope_quant_kernel(
     positions,
@@ -537,15 +798,33 @@ def sparse_attn_indexer(
                     topk_tokens,
                 )
 
-            _merge_dcp_topk_global(
-                logits,
-                topk_indices,
-                topk_tokens,
-                dcp_rank,
-                dcp_world_size,
-                cp_kv_cache_interleave_size,
-                row_starts=chunk.cu_seqlen_ks,
-            )
+            if attn_metadata_narrowed.use_sm86_dcp_topk:
+                # P2b SM8x DSV4 DCP path (VLLM_SM86_DCP): pure-torch
+                # deterministic global top-k; the CuteDSL merge below is
+                # Hopper+-only. Called for EVERY chunk on every rank (chunk
+                # splits are rank-invariant) so collectives stay symmetric.
+                topk_indices.copy_(
+                    _sm86_dcp_topk_prefill(
+                        logits,
+                        cu_seqlen_ks,
+                        topk_indices,
+                        topk_tokens,
+                        dcp_rank,
+                        dcp_world_size,
+                        cp_kv_cache_interleave_size,
+                        has_local_kv=chunk.local_total_seq_lens > 0,
+                    )
+                )
+            else:
+                _merge_dcp_topk_global(
+                    logits,
+                    topk_indices,
+                    topk_tokens,
+                    dcp_rank,
+                    dcp_world_size,
+                    cp_kv_cache_interleave_size,
+                    row_starts=chunk.cu_seqlen_ks,
+                )
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
@@ -698,7 +977,23 @@ def sparse_attn_indexer(
                 topk_tokens,
             )
 
-        if decode_metadata.global_seq_lens is not None:
+        if attn_metadata_narrowed.use_sm86_dcp_topk:
+            # P2b SM8x DSV4 DCP path (VLLM_SM86_DCP): seq_lens here are this
+            # rank's LOCAL compressed-entry counts (builder localizes
+            # divide-then-shard); the merged output is LOCAL entry indices,
+            # owned entries first, -1 padded (P2 interface contract).
+            topk_indices.copy_(
+                _sm86_dcp_topk_decode(
+                    logits,
+                    seq_lens,
+                    topk_indices,
+                    topk_tokens,
+                    dcp_rank,
+                    dcp_world_size,
+                    cp_kv_cache_interleave_size,
+                )
+            )
+        elif decode_metadata.global_seq_lens is not None:
             _merge_dcp_topk_global(
                 logits,
                 topk_indices,
