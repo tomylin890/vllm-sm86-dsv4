@@ -396,19 +396,6 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
                 "graph capture for attention (enforce_eager / cudagraph "
                 "mode NONE)."
             )
-        if self.compress_ratio != 4:
-            # Fail closed (review B/D, round 2): the C128A decode top-k
-            # metadata producer (sparse_mla.py builder + amd/rocm.py ragged
-            # copy) enumerates GLOBAL compressed-entry slots and has no DCP
-            # awareness yet — consuming them here as local-shard entries
-            # would compute silently wrong attention.  Mirrors the prefill
-            # guard above; lift once the builder emits rank-local entries
-            # via the shared ownership formulas (owner(e) = (e//I) % W).
-            raise NotImplementedError(
-                "VLLM_SM86_DCP: C128A (compress_ratio=128) decode is not "
-                "context-parallel on the SM8x path yet; sparse_mla.py's "
-                "top-k metadata builder must emit rank-local entries first."
-            )
         assert kv_cache is not None
         assert swa_metadata.is_valid_token is not None
         assert swa_metadata.decode_swa_indices is not None
@@ -417,36 +404,46 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
         num_decode_tokens = swa_metadata.num_decode_tokens
 
         # ---- Local top-k selection (this rank's KV shard only) ----
-        # Interface with the P2 indexer (reference `_topk_per_row_decode_dcp`
-        # ends in `layout.global_to_local`): under DCP `topk_indices_buffer`
-        # holds LOCAL-SHARD ENTRY COORDINATES of the globally-top-512 entries
-        # this rank owns, -1-padded to the fixed 512 width.  The entry
-        # coordinate -> physical slot translation below therefore goes
+        # Interface with the P2 producers: under DCP both compressed-layer
+        # kinds deliver rank-LOCAL SHARD ENTRY COORDINATES of the selected
+        # entries this rank owns, owned entries first (prefix-compact),
+        # -1-padded to a fixed width:
+        #   - C4A: P2b's indexer decode merge (`topk_indices_buffer`, the
+        #     globally-top-512 entries; reference `_topk_per_row_decode_dcp`
+        #     ends in `layout.global_to_local`);
+        #   - C128A (P2d W2): the sparse_mla.py builder's gated branch
+        #     (`c128a_global_decode_topk_indices` holds `[0..count-1, -1]`
+        #     rank-local rows -- C128A attends ALL completed entries, so
+        #     the owned set is a contiguous local prefix).  The amd/rocm.py
+        #     builder's dense->ragged copy is skipped under the gate (it
+        #     would pack these coordinates as if they were global slots).
+        # The entry coordinate -> physical slot translation therefore goes
         # through the P1-sharded block table with the SAME kernel as the
-        # non-DCP path; -1 rows are counted out by the ragged pack.
+        # non-DCP C4A path; -1 rows are counted out by the ragged pack and
+        # `is_valid` (from the REPLICATED SWA group's unsharded slot
+        # mapping) zeroes padding rows on every rank.
         is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
         if self.compress_ratio == 4:
             assert self.topk_indices_buffer is not None
-            (
-                topk_ragged_indices,
-                topk_ragged_indptr,
-                _topk_lens,
-            ) = compute_global_topk_ragged_indices_and_indptr(
-                self.topk_indices_buffer[:num_decode_tokens],
-                swa_metadata.token_to_req_indices,
-                attn_metadata.block_table[:num_decodes],
-                attn_metadata.block_size // self.compress_ratio,
-                is_valid,
-            )
+            local_entry_indices = self.topk_indices_buffer[:num_decode_tokens]
         else:
-            # C128A: indices are materialized by the FlashMLA metadata
-            # builder; under DCP its producer must already emit
-            # local-shard slots (P2a blocker note — not owned by this
-            # workstream's files).
-            topk_ragged_indices = attn_metadata.c128a_decode_topk_ragged_indices
-            topk_ragged_indptr = attn_metadata.c128a_decode_topk_ragged_indptr
-        assert topk_ragged_indices is not None
-        assert topk_ragged_indptr is not None
+            dense_local = attn_metadata.c128a_global_decode_topk_indices
+            assert dense_local is not None, (
+                "VLLM_SM86_DCP C128A decode requires the sparse_mla.py "
+                "builder's rank-local metadata (P2d W2)."
+            )
+            local_entry_indices = dense_local.reshape(num_decode_tokens, -1)
+        (
+            topk_ragged_indices,
+            topk_ragged_indptr,
+            _topk_lens,
+        ) = compute_global_topk_ragged_indices_and_indptr(
+            local_entry_indices,
+            swa_metadata.token_to_req_indices,
+            attn_metadata.block_table[:num_decodes],
+            attn_metadata.block_size // self.compress_ratio,
+            is_valid,
+        )
 
         # ---- SWA owner selection ----
         # The SWA ring is replicated (dcp_exempt, P1), unlike the reference

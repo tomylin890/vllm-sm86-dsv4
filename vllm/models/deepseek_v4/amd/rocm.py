@@ -6,6 +6,7 @@ from typing import cast
 
 import torch
 
+from vllm import envs
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -321,6 +322,18 @@ class DeepseekV4ROCMAiterSparseSWAMetadata(DeepseekSparseSWAMetadata):
 class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4FlashMLAMetadataBuilder):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # SM86 DCP (P2d W2): under the gate with dcp>1 the parent builder's
+        # C128A decode buffer holds rank-LOCAL ENTRY COORDINATES, not global
+        # slot ids (see DeepseekV4FlashMLAMetadata). Packing them here as if
+        # they were slots would hand mistranslated indices to any ragged
+        # consumer, so the copy below is skipped; the only gated consumer
+        # (ampere_sparse._forward_decode_dcp) builds its own ragged slots
+        # through the P1-sharded block table instead. Init-time snapshot,
+        # mirroring the parent's gate.
+        self._sm86_dcp = (
+            envs.VLLM_SM86_DCP
+            and self.vllm_config.parallel_config.decode_context_parallel_size > 1
+        )
         self.c128a_decode_topk_ragged_indices_buffer: torch.Tensor | None = None
         self.c128a_decode_topk_ragged_indptr_buffer: torch.Tensor | None = None
         if self.compress_ratio == 128:
@@ -352,7 +365,11 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4FlashMLAMetadataBuil
         ragged_indptr = None
         dense_decode = base.c128a_global_decode_topk_indices
         decode_lens = base.c128a_decode_topk_lens
-        if dense_decode is not None and decode_lens is not None:
+        if (
+            dense_decode is not None
+            and decode_lens is not None
+            and not self._sm86_dcp
+        ):
             ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
                 dense_decode.reshape(dense_decode.shape[0], -1),
                 decode_lens,
@@ -653,6 +670,19 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 topk_lens = attn_metadata.c128a_decode_topk_lens
                 topk_ragged_indices = attn_metadata.c128a_decode_topk_ragged_indices
                 topk_ragged_indptr = attn_metadata.c128a_decode_topk_ragged_indptr
+                if topk_indices is not None and topk_ragged_indices is None:
+                    # Only reachable when the SM86 DCP gate is set with
+                    # dcp>1 (the builder then emits rank-LOCAL entry
+                    # coordinates and skips the ragged copy) but attention
+                    # runs this NON-DCP decode, which would consume them as
+                    # global slots -- silently wrong. The Ampere subclass
+                    # routes compressed decode to _forward_decode_dcp; any
+                    # other layer class under the gate must fail loudly.
+                    raise NotImplementedError(
+                        "VLLM_SM86_DCP + dcp>1: C128A decode metadata is "
+                        "rank-local; the non-DCP ROCm decode path cannot "
+                        "consume it (P2d W2)."
+                    )
 
         rocm_sparse_attn_decode(
             q=q,

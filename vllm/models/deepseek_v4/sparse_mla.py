@@ -7,6 +7,7 @@ from typing import Any, ClassVar
 
 import torch
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.platforms.interface import DeviceCapability
@@ -21,7 +22,10 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.backends.utils import (
+    get_dcp_local_seq_lens,
+    split_decodes_and_prefills,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 # Pad C128A topk width to this alignment. 128 covers both h_q=64 (B_TOPK=64) and
@@ -125,9 +129,19 @@ class DeepseekV4FlashMLAMetadata(AttentionMetadata):
 
     # Pre-computed C128A metadata (compress_ratio == 128 only).
     # Decode: global slot ids + valid-entry counts (fused from positions).
+    # SM86 DCP EXCEPTION (VLLM_SM86_DCP + dcp>1, P2d W2): the decode buffer
+    # instead holds rank-LOCAL COMPRESSED-ENTRY COORDINATES [0..count-1, -1
+    # pad] of this rank's owned entries (owner(e) = (e // I) % W, the shared
+    # P2 layout), NOT global slot ids, and the lens hold the raw owned
+    # counts (validity is applied by the consumer). The only consumer under
+    # the gate -- ampere_sparse._forward_decode_dcp -- translates them to
+    # physical slots through the P1-SHARDED block table, exactly like the
+    # C4A indexer output.
     c128a_global_decode_topk_indices: torch.Tensor | None = None
     c128a_decode_topk_lens: torch.Tensor | None = None
     # Prefill: local topk indices (used by combine_topk_swa_indices).
+    # Under SM86 DCP these stay as-is: [0..n-1] in GLOBAL entry order, which
+    # is exactly how the P2d dense all-gathered prefill buffer is indexed.
     c128a_prefill_topk_indices: torch.Tensor | None = None
 
 
@@ -157,6 +171,25 @@ class DeepseekV4FlashMLAMetadataBuilder(
 
         assert hasattr(self.kv_cache_spec, "compress_ratio")
         self.compress_ratio = self.kv_cache_spec.compress_ratio
+
+        # SM86 DCP (P2d W2): C128A decode metadata must be rank-localized --
+        # the default kernel walks the GLOBAL entry range through the
+        # P1-SHARDED block table (rows sized 1/dcp of the global range),
+        # which would read out of the owned range. Init-time snapshot, like
+        # the indexer builder's use_sm86_dcp, so a mid-run env flip cannot
+        # desynchronize producer and consumer.
+        parallel_config = vllm_config.parallel_config
+        self._sm86_dcp_c128a = (
+            envs.VLLM_SM86_DCP
+            and parallel_config.decode_context_parallel_size > 1
+            and self.compress_ratio == 128
+        )
+        if self._sm86_dcp_c128a:
+            from vllm.distributed import get_dcp_group
+
+            self._dcp_world_size = parallel_config.decode_context_parallel_size
+            self._dcp_rank = get_dcp_group().rank_in_group
+            self._cp_interleave = parallel_config.cp_kv_cache_interleave_size
 
         # Pre-allocate compressed slot mapping buffer for CUDA graph address
         # stability when compress_ratio > 1.
@@ -269,19 +302,32 @@ class DeepseekV4FlashMLAMetadataBuilder(
             self.c128a_max_compressed,
         )
         block_size = self.kv_cache_spec.block_size // self.compress_ratio
-        global_decode, decode_lens, prefill_local = build_c128a_topk_metadata(
-            cm.positions[:num_total],
-            self.compress_ratio,
-            num_decode_tokens,
-            req_id_per_token,
-            cm.block_table_tensor[:num_decodes],
-            block_size,
-            cm.slot_mapping,
-            self.c128a_global_decode_buffer,
-            self.c128a_decode_lens_buffer,
-            self.c128a_prefill_buffer,
-            max_compressed_tokens=active_topk_width,
-        )
+        if self._sm86_dcp_c128a:
+            global_decode, decode_lens, prefill_local = (
+                self._build_c128a_metadata_sm86_dcp(
+                    cm,
+                    req_id_per_token,
+                    num_decodes,
+                    num_decode_tokens,
+                    num_total,
+                    active_topk_width,
+                    block_size,
+                )
+            )
+        else:
+            global_decode, decode_lens, prefill_local = build_c128a_topk_metadata(
+                cm.positions[:num_total],
+                self.compress_ratio,
+                num_decode_tokens,
+                req_id_per_token,
+                cm.block_table_tensor[:num_decodes],
+                block_size,
+                cm.slot_mapping,
+                self.c128a_global_decode_buffer,
+                self.c128a_decode_lens_buffer,
+                self.c128a_prefill_buffer,
+                max_compressed_tokens=active_topk_width,
+            )
 
         result: dict[str, torch.Tensor | None] = {}
         if num_decode_tokens > 0:
@@ -292,6 +338,105 @@ class DeepseekV4FlashMLAMetadataBuilder(
         if num_prefill_tokens > 0:
             result["c128a_prefill_topk_indices"] = prefill_local
         return result
+
+    def _build_c128a_metadata_sm86_dcp(
+        self,
+        cm: CommonAttentionMetadata,
+        req_id_per_token: torch.Tensor,
+        num_decodes: int,
+        num_decode_tokens: int,
+        num_total: int,
+        active_topk_width: int,
+        block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """C128A metadata under VLLM_SM86_DCP + dcp>1 (P2d W2).
+
+        Decode rows are rank-LOCALIZED: for a token at global position
+        ``pos`` with ``n = (pos + 1) // 128`` completed entries (causal rule
+        ``(t+1)//m``, rule 3), this rank owns the entries
+        ``{e < n : (e // I) % W == rank}`` (the shared P2 entry-space
+        layout). Their rank-local coordinates under
+        ``local(e) = (e // (I*W))*I + e % I`` are exactly ``0..count-1``:
+        the local enumeration is an order-preserving bijection onto a
+        contiguous prefix, so the row is ``[0..count-1, -1 pad]`` -- already
+        owned-first prefix-compacted, matching P2b's decode convention. The
+        owned count comes from ``get_dcp_local_seq_lens`` (the base layout
+        helper P2b validated against the shared formulas; no third
+        reimplementation of the algebra).
+
+        Deltas vs the default builder path:
+        - the fused kernel runs in PREFILL-ONLY mode: its decode branch
+          resolves GLOBAL entry indices through the block table, but the
+          P1-sharded C128A table rows are 1/dcp of the global entry range,
+          so global-width walks would read past the owned rows. Prefill
+          rows are unchanged (``[0..n-1]`` identity, no table access) and
+          index the P2d dense global-order gathered buffer directly.
+        - physical-slot translation moves to the consumer
+          (``ampere_sparse._forward_decode_dcp``), which pushes these local
+          coordinates through the SAME kernel as the C4A indexer output
+          (``compute_global_topk_ragged_indices_and_indptr`` with the
+          sharded block table).
+        - ``decode_lens`` hold the RAW owned counts. The default path
+          zeroes lens for padding via ``cm.slot_mapping < 0``, but under
+          DCP that mapping is the P1-SHARDED token-space mapping whose -1s
+          mark NON-OWNED tokens (not padding) -- using it would drop real
+          tokens. The only gated consumer recomputes lens from the -1
+          layout with the replicated SWA group's ``is_valid_token``, which
+          also covers padding rows (their garbage positions are bounded by
+          the clamp below and never dereferenced: length 0 packs nothing).
+
+        All writes land in the same persistent buffers as the default path
+        (CUDA-graph address stability; the fill is fixed-shape given the
+        same token counts and width).
+        """
+        num_prefill_tokens = num_total - num_decode_tokens
+        _, _, prefill_local = build_c128a_topk_metadata(
+            cm.positions[num_decode_tokens:num_total],
+            self.compress_ratio,
+            0,  # prefill-only: never run the kernel's decode branch
+            req_id_per_token,
+            cm.block_table_tensor[:num_decodes],
+            block_size,
+            cm.slot_mapping,
+            self.c128a_global_decode_buffer,
+            self.c128a_decode_lens_buffer,
+            self.c128a_prefill_buffer,
+            max_compressed_tokens=active_topk_width,
+        )
+        assert prefill_local.shape[0] == num_prefill_tokens
+
+        width = active_topk_width
+        global_decode = self.c128a_global_decode_buffer.view(-1)[
+            : num_decode_tokens * width
+        ].view(num_decode_tokens, width)
+        decode_lens = self.c128a_decode_lens_buffer[:num_decode_tokens]
+        if num_decode_tokens > 0:
+            positions = cm.positions[:num_decode_tokens]
+            # Global entry count, clamped exactly like the kernel's
+            # max_compressed_tokens bound (also bounds padding-row garbage).
+            num_entries = torch.clamp(
+                (positions.to(torch.int64) + 1) // self.compress_ratio,
+                max=width,
+            )
+            local_counts = get_dcp_local_seq_lens(
+                num_entries,
+                self._dcp_world_size,
+                self._dcp_rank,
+                self._cp_interleave,
+            )
+            entry_range = torch.arange(
+                width, dtype=torch.int32, device=positions.device
+            )
+            rows = torch.where(
+                entry_range.unsqueeze(0) < local_counts.unsqueeze(1),
+                entry_range.unsqueeze(0).expand(num_decode_tokens, width),
+                torch.full(
+                    (), -1, dtype=torch.int32, device=positions.device
+                ),
+            )
+            global_decode.copy_(rows)
+            decode_lens.copy_(local_counts)
+        return global_decode, decode_lens, prefill_local
 
 
 def build_c128a_topk_metadata(
