@@ -1238,10 +1238,15 @@ def _sparse_attn_decode_ragged_kernel(
     attn_sink_ptr,
     fp8_lut_ptr,
     out_ptr,
+    # Pre-sink softmax stats (DCP partials): fp32 [num_queries, num_heads]
+    # running row-max / sum-exp, written only when EMIT_SOFTMAX_STATS.
+    part_m_ptr,
+    part_l_ptr,
     q_stride0,
     q_stride1,
     out_stride0,
     out_stride1,
+    stats_stride0,
     main_cache_stride0,
     extra_cache_stride0,
     main_num_rows,
@@ -1251,6 +1256,7 @@ def _sparse_attn_decode_ragged_kernel(
     scale,
     num_heads,
     HAS_ATTN_SINK: tl.constexpr,
+    EMIT_SOFTMAX_STATS: tl.constexpr,
     HAS_EXTRA: tl.constexpr,
     NOPE_DIM: tl.constexpr,
     NOPE_BLOCK: tl.constexpr,
@@ -1455,6 +1461,18 @@ def _sparse_attn_decode_ragged_kernel(
         out_rope,
         mask=head_mask[:, None],
     )
+
+    if EMIT_SOFTMAX_STATS:
+        # Raw PRE-sink running stats for the cross-rank DCP merge: m_i / l_i
+        # are untouched by the HAS_ATTN_SINK block above (the caller passes
+        # attn_sink=None with this flag, so the stored `out` is the sink-less
+        # normalized partial matching these stats).  Empty segments keep the
+        # finite `neg_large` row-max and l == 0; the Python merge maps those
+        # to the finite LSE sentinel (never -inf) and drops them
+        # (ARCHITECTURE.md section 10 rules 1/9).
+        stats_offsets = query_idx * stats_stride0 + head_offsets
+        tl.store(part_m_ptr + stats_offsets, m_i, mask=head_mask)
+        tl.store(part_l_ptr + stats_offsets, l_i, mask=head_mask)
 
 
 @triton.jit
@@ -2003,7 +2021,23 @@ def _rocm_sparse_attn_decode_ragged_triton(
     extra_cache: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
-) -> torch.Tensor:
+    return_softmax_stats: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Ragged sparse decode.
+
+    With ``return_softmax_stats=True`` (the VLLM_SM86_DCP partial contract)
+    the single-pass kernel additionally emits the raw PRE-sink softmax stats
+    and the function returns ``(out, m, l)``:
+
+    - ``out``: bf16 ``[num_queries, num_heads, head_dim]`` — attention
+      normalized by this shard's own sum-exp, WITHOUT the attention sink
+      (``attn_sink`` must be None; the sink is applied exactly once at the
+      cross-rank merge, ARCHITECTURE.md section 10 rule 1).
+    - ``m``: fp32 ``[num_queries, num_heads]`` running max of scaled logits
+      (finite ``-3.4e38`` for empty rows, never ``-inf``).
+    - ``l``: fp32 ``[num_queries, num_heads]`` sum of ``exp(logit - m)``
+      (0 for empty rows), natural exp/log domain.
+    """
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert main_cache.ndim == 3, (
         f"expected main_cache=[blocks,block,bytes], got {main_cache.shape}"
@@ -2021,6 +2055,12 @@ def _rocm_sparse_attn_decode_ragged_triton(
 
     main_indices = _as_int32_contiguous_1d(main_indices)
     main_indptr = _as_int32_contiguous_1d(main_indptr)
+    if return_softmax_stats:
+        assert attn_sink is None, (
+            "return_softmax_stats emits PRE-sink partials; the attention "
+            "sink must be applied exactly once at the cross-rank merge "
+            "(pass attn_sink=None)."
+        )
     has_attn_sink = attn_sink is not None
     if attn_sink is None:
         attn_sink = torch.empty(1, device=q.device, dtype=torch.float32)
@@ -2073,7 +2113,24 @@ def _rocm_sparse_attn_decode_ragged_triton(
     # hardware fp8 convert exists.
     fp8_lut = get_e4m3fn_bf16_lut(q.device)
 
-    if not (_ON_GFX942 or _ON_GFX950):  # Fallback path for un-tuned architectures.
+    # Single-pass path: fallback for un-tuned architectures (CUDA SM8x lands
+    # here), and ALWAYS when pre-sink softmax stats are requested — the
+    # gfx942/gfx950 split-K pair applies the sink inside its reduce kernel
+    # and never materializes global (m, l), so the DCP partial contract is
+    # only implemented single-pass (eager correctness first; see P2a notes).
+    if return_softmax_stats or not (_ON_GFX942 or _ON_GFX950):
+        if return_softmax_stats:
+            part_m = torch.empty(
+                (num_queries, num_heads), dtype=torch.float32, device=q.device
+            )
+            part_l = torch.empty_like(part_m)
+            stats_stride0 = part_m.stride(0)
+        else:
+            # Dummy pointers; EMIT_SOFTMAX_STATS=False compiles the stores
+            # out, keeping the default path byte-identical in behavior.
+            part_m = torch.empty(1, device=q.device, dtype=torch.float32)
+            part_l = part_m
+            stats_stride0 = 0
         block_k = 16 if head_dim >= 256 else 32
         _sparse_attn_decode_ragged_kernel[(num_queries, heads_blocks)](
             q,
@@ -2086,10 +2143,13 @@ def _rocm_sparse_attn_decode_ragged_triton(
             attn_sink,
             fp8_lut,
             out,
+            part_m,
+            part_l,
             q.stride(0),
             q.stride(1),
             out.stride(0),
             out.stride(1),
+            stats_stride0,
             main_cache.stride(0),
             extra_cache.stride(0),
             main_cache.shape[0] * main_cache.shape[1],
@@ -2099,6 +2159,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
             scale,
             num_heads,
             HAS_ATTN_SINK=has_attn_sink,
+            EMIT_SOFTMAX_STATS=return_softmax_stats,
             HAS_EXTRA=has_extra,
             NOPE_DIM=nope_head_dim,
             NOPE_BLOCK=nope_block,
@@ -2109,6 +2170,8 @@ def _rocm_sparse_attn_decode_ragged_triton(
             BLOCK_K=block_k,
             num_warps=8,
         )
+        if return_softmax_stats:
+            return out, part_m, part_l
         return out
 
     block_k = 32  # KV tokens walked per split-K iteration. Tuned on gfx950.
@@ -2216,7 +2279,8 @@ def _rocm_sparse_attn_decode_triton(
     main_ragged_indptr: torch.Tensor | None = None,
     extra_ragged_indices: torch.Tensor | None = None,
     extra_ragged_indptr: torch.Tensor | None = None,
-) -> torch.Tensor:
+    return_softmax_stats: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if main_ragged_indices is None or main_ragged_indptr is None:
         main_ragged_indices, main_ragged_indptr = build_ragged_indices_from_dense(
             main_indices,
@@ -2251,6 +2315,7 @@ def _rocm_sparse_attn_decode_triton(
         extra_cache=extra_cache,
         extra_indices=extra_ragged_indices,
         extra_indptr=extra_ragged_indptr,
+        return_softmax_stats=return_softmax_stats,
     )
 
 
@@ -2321,8 +2386,27 @@ def rocm_sparse_attn_decode(
     head_dim: int,
     nope_head_dim: int,
     rope_head_dim: int,
-    output: torch.Tensor,
-) -> None:
+    output: torch.Tensor | None,
+    return_softmax_stats: bool = False,
+) -> None | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sparse decode over the SWA (main) + compressed top-k (extra) caches.
+
+    Default (``return_softmax_stats=False``): applies ``attn_sink`` inside
+    the kernel and writes the normalized bf16 result into ``output``
+    (unchanged behavior).
+
+    ``return_softmax_stats=True`` (VLLM_SM86_DCP partial contract):
+    ``attn_sink`` must be None and ``output`` is ignored (pass None); the
+    call returns the raw PRE-sink partials ``(o, m, l)`` — see
+    ``_rocm_sparse_attn_decode_ragged_triton`` — for the fp32 cross-rank
+    merge, where the sink is applied exactly once at the global max
+    (ARCHITECTURE.md section 10 rules 1/2/9).
+    """
+    if return_softmax_stats:
+        assert attn_sink is None, (
+            "return_softmax_stats emits PRE-sink partials; apply the sink "
+            "once at the cross-rank merge instead."
+        )
     assert swa_k_cache.dtype == torch.uint8, (
         "ROCm Triton sparse decode expects uint8 fp8_ds_mla SWA cache, "
         f"got {swa_k_cache.dtype}"
@@ -2367,5 +2451,12 @@ def rocm_sparse_attn_decode(
         main_ragged_indptr=swa_ragged_indptr,
         extra_ragged_indices=topk_ragged_indices,
         extra_ragged_indptr=topk_ragged_indptr,
+        return_softmax_stats=return_softmax_stats,
     )
+    if return_softmax_stats:
+        assert isinstance(attn_out, tuple)
+        return attn_out
+    assert isinstance(attn_out, torch.Tensor)
+    assert output is not None, "output buffer required without softmax stats"
     output.copy_(attn_out.to(output.dtype))
+    return None
