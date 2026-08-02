@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import ClassVar
 
+from vllm import envs
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -75,7 +76,18 @@ class SingleTypeKVCacheManager(ABC):
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        if dcp_world_size > 1:
+        if dcp_world_size > 1 and not (
+            envs.VLLM_SM86_DCP and isinstance(kv_cache_spec, SlidingWindowSpec)
+        ):
+            # Under DCP each rank stores 1/dcp of a group's tokens, so one
+            # logical block covers block_size * dcp tokens.
+            # VLLM_SM86_DCP (DeepseekV4-sparse hybrid DCP): sliding-window
+            # groups (SWA KV + fp32 compressor-state SlidingWindowMLASpec)
+            # are dcp_exempt -- REPLICATED on every DCP rank, never
+            # round-robin sharded -- so their allocation stays unsharded
+            # (plain block_size), matching the worker-side full block tables
+            # (see block_table.py shard_dcp / SlidingWindowSpec.
+            # max_num_blocks_per_req).
             self.block_size *= dcp_world_size
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool

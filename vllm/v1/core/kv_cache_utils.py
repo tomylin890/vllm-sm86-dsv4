@@ -656,6 +656,15 @@ def resolve_kv_cache_block_sizes(
         else g.kv_cache_spec.block_size
         for g in groups
     ]
+    # Note (VLLM_SM86_DCP, DeepseekV4-sparse hybrid DCP): multi-group CP
+    # relies on exactly this formula -- for all-attention hybrids
+    # lcm(bs_i * dcp) == lcm(bs_i) * dcp, i.e. the scheduler token-alignment
+    # invariant is LCM of the group block sizes scaled by dcp, KEEPING the
+    # hybrid groups (and their 4x/128x compression) intact, unlike
+    # --disable-hybrid-kv-cache-manager which unifies to the max page size
+    # and destroys the compression. dcp_exempt (replicated) sliding-window
+    # groups do not need the dcp scale, but the coarser LCM is a safe
+    # superset alignment, so no gating is required here.
     scheduler_block_size = math.lcm(*group_block_sizes)
 
     # Block hashes are only consumed by prefix caching and KV connectors
