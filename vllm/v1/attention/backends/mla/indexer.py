@@ -437,6 +437,11 @@ class DeepseekV32IndexerMetadata:
 
     decode: DeepSeekV32IndexerDecodeMetadata | None = None
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
+    # P2b (SM8x DSV4 DCP): True only when VLLM_SM86_DCP is set AND
+    # dcp_world_size > 1 AND compress_ratio > 1. Routes sparse_attn_indexer to
+    # the pure-torch deterministic global top-k merge instead of the
+    # CuteDSL-only _merge_dcp_topk_global path.
+    use_sm86_dcp_topk: bool = False
 
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
@@ -571,11 +576,26 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # Get compress_ratio for DeepseekV4 support
         if isinstance(self.kv_cache_spec, MLAAttentionSpec):
             self.compress_ratio = self.kv_cache_spec.compress_ratio
-        if self.dcp_world_size > 1 and self.compress_ratio > 1:
+        # P2b (SM8x DSV4 DCP): under VLLM_SM86_DCP the sparse indexer supports
+        # compressed KV with DCP -- each rank scores its local compressed-entry
+        # shard and the global top-k is merged in sparse_attn_indexer. Without
+        # the gate this combination remains unimplemented, so fail closed.
+        if (
+            self.dcp_world_size > 1
+            and self.compress_ratio > 1
+            and not envs.VLLM_SM86_DCP
+        ):
             raise NotImplementedError(
                 "DCP is not supported with sparse indexer KV compression "
-                f"(compress_ratio={self.compress_ratio})."
+                f"(compress_ratio={self.compress_ratio}). "
+                "Set VLLM_SM86_DCP=1 for the SM8x DeepSeek-V4 DCP path."
             )
+        # True only for the gated SM8x DSV4 DCP path (dcp>1 + compressed
+        # indexer KV). Guard above makes this unreachable without the env gate,
+        # so with VLLM_SM86_DCP unset every default code path is unchanged.
+        self.use_sm86_dcp = (
+            envs.VLLM_SM86_DCP and self.dcp_world_size > 1 and self.compress_ratio > 1
+        )
 
         # Pre-allocate buffers for CUDA graph compatibility when
         if self.compress_ratio > 1:
@@ -592,6 +612,73 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 dtype=torch.int32,
                 device=self.device,
             )
+
+    def _sm86_dcp_compressed_slot_mapping(
+        self,
+        num_tokens: int,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        """DCP-aware variant of get_compressed_slot_mapping (P2b, only called
+        under VLLM_SM86_DCP with dcp_world_size > 1 and compress_ratio > 1).
+
+        Entry ownership follows the interleave-aware round-robin layout in
+        COMPRESSED-ENTRY space -- owner(e) = (e // interleave) % world -- the
+        same layout as get_dcp_local_seq_lens and the DCP localization inside
+        BuildPrefillChunkMetadataKernel, so scoring, gathering and writes all
+        agree. A token completing entry e ((pos + 1) % compress_ratio == 0)
+        writes only on the owning rank, at the rank-LOCAL entry index
+        l = (e // (interleave * world)) * interleave + e % interleave through
+        the P1-sharded block table (block l // storage_block_size, offset
+        l % storage_block_size); every other token maps to the invalid-slot
+        sentinel -1 (ARCHITECTURE.md section 2) so the cache-insert op skips
+        it. Kept in this file (not compressor_utils.py) to respect P2 file
+        ownership; the default path still uses get_compressed_slot_mapping.
+        """
+        out = self.compressed_slot_mapping_buffer
+        # Fill the WHOLE buffer with -1 (mirrors get_compressed_slot_mapping):
+        # padded/invalid rows must never alias a real slot.
+        out.fill_(-1)
+        if num_tokens == 0:
+            return out[:num_tokens]
+
+        world = self.dcp_world_size
+        interleave = self.cp_kv_cache_interleave_size
+
+        token_ids = self.arange_buffer[:num_tokens]
+        # Token -> request id. query_start_loc is non-decreasing; right=True
+        # lands after every boundary <= i, so empty (padded) requests are
+        # skipped correctly.
+        req_ids = torch.searchsorted(query_start_loc, token_ids, right=True) - 1
+        starts = query_start_loc[req_ids].to(torch.int64)
+        ends = query_start_loc[req_ids + 1].to(torch.int64)
+        # Global absolute position of each query token (rule: positions are
+        # GLOBAL everywhere; per-shard renumbering is a silent precision bug).
+        pos = (
+            seq_lens[req_ids].to(torch.int64)
+            - (ends - starts)
+            + (token_ids.to(torch.int64) - starts)
+        )
+
+        entry = pos // self.compress_ratio
+        completes_entry = (pos + 1) % self.compress_ratio == 0
+        safe_entry = torch.clamp(entry, min=0)
+        owned = (safe_entry // interleave) % world == self.dcp_rank
+        local_entry = (
+            safe_entry // (interleave * world)
+        ) * interleave + safe_entry % interleave
+        block_ids = torch.clamp(
+            local_entry // block_size, max=block_table.shape[1] - 1
+        )
+        block_numbers = block_table[req_ids, block_ids].to(torch.int64)
+        slot_ids = block_numbers * block_size + local_entry % block_size
+        valid = completes_entry & owned & (pos >= 0)
+        out[:num_tokens] = torch.where(
+            valid, slot_ids, torch.full_like(slot_ids, -1)
+        )
+        return out[:num_tokens]
 
     def _dcp_localize_decode_seq_lens(
         self,
@@ -794,15 +881,26 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             padded_num_tokens = num_tokens
             if self.pcp_world_size > 1:
                 padded_num_tokens = slot_mapping.shape[0] // self.pcp_world_size
-            compressed_slot_mapping = get_compressed_slot_mapping(
-                num_tokens,
-                query_start_loc,
-                seq_lens,
-                block_table,
-                self.kv_cache_spec.storage_block_size,
-                self.compress_ratio,
-                out=self.compressed_slot_mapping_buffer,
-            )
+            if self.use_sm86_dcp:
+                # P2b: route entry writes through the P1-sharded block table
+                # (only this rank's owned entries get real slots).
+                compressed_slot_mapping = self._sm86_dcp_compressed_slot_mapping(
+                    num_tokens,
+                    query_start_loc,
+                    seq_lens,
+                    block_table,
+                    self.kv_cache_spec.storage_block_size,
+                )
+            else:
+                compressed_slot_mapping = get_compressed_slot_mapping(
+                    num_tokens,
+                    query_start_loc,
+                    seq_lens,
+                    block_table,
+                    self.kv_cache_spec.storage_block_size,
+                    self.compress_ratio,
+                    out=self.compressed_slot_mapping_buffer,
+                )
             if self.pcp_world_size > 1:
                 compressed_slot_mapping = get_pcp_group().all_gather(
                     self.compressed_slot_mapping_buffer[:padded_num_tokens],
@@ -922,14 +1020,39 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # DCP: localize the now-expanded per-token global bounds to this
             # rank's owned KV. Done here (after expansion) so each token's global
             # causal length is localized individually; see the comment above.
-            if dcp_local_seq_lens is not None:
+            if dcp_local_seq_lens is not None and self.compress_ratio > 1:
+                # P2b (SM8x DSV4 DCP; unreachable without VLLM_SM86_DCP --
+                # __init__ raises for dcp>1 + compress_ratio>1 otherwise).
+                # Order is compress-THEN-localize, in compressed-ENTRY space:
+                # a token at global position t sees (t+1)//m compressed
+                # entries (causal rule, ARCHITECTURE.md section 10 rule 3),
+                # and this rank owns the interleave-round-robin share of THAT
+                # entry count. The reverse order (localize token counts, then
+                # divide by m) undercounts: world=2, rank=0, interleave=1,
+                # m=4, seq_len=12 -> global entries {0,1,2}, rank0 owns {0,2}
+                # (2 entries), but localize(12)//4 = 6//4 = 1.
+                local_compressed_seq_lens = get_dcp_local_seq_lens(
+                    seq_lens // self.compress_ratio,
+                    self.dcp_world_size,
+                    self.dcp_rank,
+                    self.cp_kv_cache_interleave_size,
+                )
+                # Copy into a builder-owned buffer (mirrors the non-DCP branch
+                # below): avoids mutating shared state and keeps the CUDA
+                # graph address stable.
+                num_elems = local_compressed_seq_lens.numel()
+                seq_lens_buffer = self.expanded_seq_lens_buffer[:num_elems].view_as(
+                    seq_lens
+                )
+                seq_lens_buffer.copy_(local_compressed_seq_lens)
+                seq_lens = seq_lens_buffer
+            elif dcp_local_seq_lens is not None:
                 seq_lens = self._dcp_localize_decode_seq_lens(
                     seq_lens, num_decodes, seq_lens_is_buffer_view
                 )
-
             # For DeepseekV4 (compress_ratio > 1), the indexer KV cache stores
             # compressed tokens. Convert uncompressed seq_lens to compressed.
-            if self.compress_ratio > 1:
+            elif self.compress_ratio > 1:
                 if seq_lens_is_buffer_view:
                     seq_lens //= self.compress_ratio
                 else:
@@ -973,6 +1096,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             num_prefill_tokens=num_prefill_tokens,
             prefill=prefill_metadata,
             decode=decode_metadata,
+            use_sm86_dcp_topk=self.use_sm86_dcp,
         )
 
         return attn_metadata
