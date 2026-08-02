@@ -123,6 +123,7 @@ if TYPE_CHECKING:
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_DISABLE_PYNCCL: bool = False
+    VLLM_SM86_DCP: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
@@ -1170,6 +1171,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (
         os.getenv("VLLM_DISABLE_PYNCCL", "False").lower() in ("true", "1")
+    ),
+    # Experimental: enable decode context parallel (DCP) for hybrid
+    # multi-block-size KV cache layouts (DeepseekV4-sparse on SM8x).
+    # Sliding-window groups (SWA KV + fp32 compressor-state
+    # SlidingWindowMLASpec groups) become "dcp_exempt": replicated across
+    # DCP ranks instead of round-robin sharded; only the compressed-KV
+    # MLAAttentionSpec groups shard. Default off: all default code paths
+    # are byte-for-byte unchanged when this is unset.
+    "VLLM_SM86_DCP": lambda: (
+        os.getenv("VLLM_SM86_DCP", "False").lower() in ("true", "1")
     ),
     # Optional: enable external Oink custom ops (e.g., Blackwell RMSNorm).
     # Disabled by default.
