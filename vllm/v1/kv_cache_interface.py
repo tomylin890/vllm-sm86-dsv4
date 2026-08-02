@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 import torch
 from typing_extensions import Self
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import get_dtype_size, nvfp4_kv_cache_full_dim
@@ -607,10 +608,33 @@ class SlidingWindowSpec(AttentionSpec):
         # [XXCD][EF] to store the 6-token window [CDEF].
         return cdiv(num_tokens, self.block_size) + 1
 
+    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
+        if envs.VLLM_SM86_DCP:
+            # VLLM_SM86_DCP: sliding-window groups are "dcp_exempt" --
+            # replicated across DCP ranks, never round-robin sharded (a shard
+            # would split the window / the fp32 compressor state). The worker
+            # block table therefore holds the FULL unsharded sequence, so do
+            # not divide by the DCP world size like AttentionSpec does.
+            # Covers SlidingWindowMLASpec (compressor-state groups) via
+            # inheritance.
+            return cdiv(max_len, self.block_size)
+        return super().max_num_blocks_per_req(vllm_config, max_len)
+
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        assert vllm_config.parallel_config.decode_context_parallel_size == 1, (
-            "DCP not support sliding window."
-        )
+        # DCP shards full-attention groups across ranks but CANNOT shard a
+        # sliding-window group (the window is data-dependent / round-robin
+        # sharding would split the window). On SM86 DeepseekV4-sparse the SWA
+        # group is a tiny fixed 128-token window, and the fp32 compressor-state
+        # groups (SlidingWindowMLASpec) are small recurrent state, so under
+        # VLLM_SM86_DCP we keep them REPLICATED across DCP ranks instead of
+        # asserting dcp==1: the unsharded per-rank size below is exactly the
+        # replicated footprint, and block_table.py is told to not round-robin
+        # shard these groups (dcp_exempt). Gated so upstream sliding-window
+        # models keep the original hard guard.
+        if not envs.VLLM_SM86_DCP:
+            assert vllm_config.parallel_config.decode_context_parallel_size == 1, (
+                "DCP not support sliding window."
+            )
         max_blocks = self.max_admission_blocks_per_request(
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             max_model_len=vllm_config.model_config.max_model_len,
@@ -629,7 +653,18 @@ class SlidingWindowSpec(AttentionSpec):
 
 @dataclass(frozen=True, kw_only=True)
 class SlidingWindowMLASpec(SlidingWindowSpec):
-    """Sliding window attention with MLA cache format."""
+    """Sliding window attention with MLA cache format.
+
+    DCP note (VLLM_SM86_DCP): this spec backs the DeepseekV4 fp32
+    compressor-state groups (CSA/HCA carry-over state and the indexer's own
+    compressor state). It does not add DCP-hostile asserts of its own; it
+    inherits `max_memory_usage_bytes` (gated dcp==1 assert, replicated
+    footprint) and the gated unsharded `max_num_blocks_per_req` from
+    SlidingWindowSpec, so these groups are dcp_exempt (replicated across DCP
+    ranks) exactly like the SWA KV group. Round-robin sharding them would
+    split the recurrent fp32 state across ranks and silently corrupt the
+    compression (see ARCHITECTURE.md sections 7 and 10 in dsv4-dcp).
+    """
 
     cache_dtype_str: str | None = None
     # DeepseekV4-only: see MLAAttentionSpec.model_version.
