@@ -177,6 +177,17 @@ def quantize_and_insert_k_cache(
     ``use_fnuz=True`` selects FNUZ E4M3 cache encoding and is only valid on
     platforms whose FP8 format is FNUZ. ``use_fnuz=False`` selects OCP E4M3,
     which is used by OCP-encoded caches even on gfx942.
+
+    DCP note (VLLM_SM86_DCP, P2c): this per-token K insert targets the SWA
+    ring / raw-K caches, which are dcp_exempt (replicated) groups under P1;
+    their slot_mapping comes from an unsharded (shard_dcp=False) BlockTable,
+    so under DCP every rank performs the identical write for every token and
+    no sharding translation is needed here. The ``slot_idx == -1`` skip
+    covers CUDA-graph pads. The same replication argument covers the fused
+    csrc SWA insert (fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu, built
+    for SM80+): it consumes the same replicated SWA slot_mapping, so its
+    behavior under the gate is byte-identical to the non-DCP path and it
+    intentionally is NOT gated off.
     """
     assert k.dim() == 2 and k.shape[1] == 512, (
         f"K must be [num_tokens, 512], got {k.shape}"

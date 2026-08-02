@@ -53,11 +53,46 @@ def compress_norm_rope_store_triton(
     quant_block: int,
     token_stride: int,
     scale_dim: int,
+    dcp_world_size: int = 1,
+    dcp_rank: int = 0,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> None:
     """Shared triton launcher for the fused compress+norm+RoPE+insert path.
 
     Picks one of the three kernels in this module based on ``head_dim`` and
     ``use_fp4_cache``. Identical launch signature for all three.
+
+    DCP (VLLM_SM86_DCP, ``dcp_world_size > 1``): the compressed-KV groups are
+    round-robin sharded across DCP ranks in COMPRESSED-ENTRY space (the fp32
+    compressor state read above stays replicated / dcp_exempt, so every rank
+    computes every entry identically in fp32). Layout contract shared with
+    the indexer/attention side (sparse_attn_indexer._sm86_dcp_* helpers,
+    indexer.py::_sm86_dcp_compressed_slot_mapping, get_dcp_local_seq_lens;
+    same formulas as the Lasimeri reference ContextParallelLayout), with
+    ``I = cp_kv_cache_interleave_size`` applied directly to entry indices:
+
+      owner(e)       = (e // I) % world
+      local_entry(e) = (e // (I * world)) * I + e % I      (owned e only)
+      slot(e)        = block_table[req][local_entry // storage_block_size]
+                       * storage_block_size
+                       + local_entry % storage_block_size
+
+    Each rank must store ONLY the entries it owns:
+
+    - head_dim == 512 (sparse-attn cache): the entry write is routed through
+      the P1 sharded per-rank block table (``k_cache_metadata.block_table``)
+      with the translation above done in-kernel. The builder's
+      ``k_cache_metadata.slot_mapping`` (compressor_utils.
+      get_compressed_slot_mapping) is NOT DCP-aware in this base -- it
+      indexes the sharded block-table row with a GLOBAL page index -- so it
+      is ignored under DCP.
+    - head_dim == 128 (FP8 indexer cache): ownership is enforced
+      arithmetically in-kernel (non-owned entries return before any store,
+      so a stale unsharded mapping can never cause cross-rank double
+      writes); the slot value for owned entries comes from the indexer
+      builder's DCP-aware compressed slot mapping
+      (indexer.py::_sm86_dcp_compressed_slot_mapping), which implements the
+      identical formula.
     """
     if head_dim == 512:
         kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
@@ -68,6 +103,30 @@ def compress_norm_rope_store_triton(
     else:
         kernel = _fused_kv_compress_norm_rope_insert_indexer_attn
         num_warps = 1
+
+    if dcp_world_size > 1:
+        if use_fp4_cache:
+            raise NotImplementedError(
+                "VLLM_SM86_DCP: the MXFP4 indexer cache has no DCP write "
+                "path (SM8x uses the FP8 indexer cache layout)."
+            )
+        # Entry-space interleave: the config value applied DIRECTLY to
+        # compressed-entry indices (shared P2 convention; see docstring).
+        dcp_entry_interleave = cp_kv_cache_interleave_size
+        if head_dim == 512:
+            kv_block_table = k_cache_metadata.block_table
+            assert kv_block_table is not None, (
+                "VLLM_SM86_DCP: sparse-attn metadata must carry the sharded "
+                "block table for the compressed-entry write path"
+            )
+            kv_block_table_stride = kv_block_table.stride(0)
+        else:
+            kv_block_table = None
+            kv_block_table_stride = 0
+    else:
+        dcp_entry_interleave = 1
+        kv_block_table = None
+        kv_block_table_stride = 0
 
     kernel[(num_actual,)](
         # state cache
@@ -91,6 +150,8 @@ def compress_norm_rope_store_triton(
         kv_cache,
         k_cache_metadata.slot_mapping,
         kv_cache.shape[1],  # paged KV cache block size (tokens per block)
+        kv_block_table,
+        kv_block_table_stride,
         # constexprs
         HEAD_SIZE=head_dim,
         TRITON_BLOCK_SIZE=triton.next_power_of_2(head_dim),
@@ -103,6 +164,9 @@ def compress_norm_rope_store_triton(
         TOKEN_STRIDE=token_stride,
         SCALE_DIM=scale_dim,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
+        DCP_WORLD_SIZE=dcp_world_size,
+        DCP_RANK=dcp_rank,
+        DCP_ENTRY_INTERLEAVE=dcp_entry_interleave,
         num_warps=num_warps,
         **pdl_kwargs,
     )
@@ -134,6 +198,8 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     k_cache_ptr,
     kv_slot_mapping_ptr,
     kv_cache_block_size,
+    kv_block_table_ptr,
+    kv_block_table_stride,
     # ── constexprs ──
     HEAD_SIZE: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
@@ -146,6 +212,9 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     TOKEN_STRIDE: tl.constexpr,  # 576 for DeepseekV4
     SCALE_DIM: tl.constexpr,  # 8 for DeepseekV4 (7 real + 1 pad)
     KV_BLOCK_STRIDE: tl.constexpr,
+    DCP_WORLD_SIZE: tl.constexpr = 1,
+    DCP_RANK: tl.constexpr = 0,
+    DCP_ENTRY_INTERLEAVE: tl.constexpr = 1,
 ):
     """Fused compress → RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope).
 
@@ -154,6 +223,16 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     Cache block layout (``block_size`` tokens):
       [0, bs*576):       token data (448 fp8 + 128 bf16 each)
       [bs*576, +bs*8):   uint8 UE8M0 scales (7 real + 1 pad each)
+
+    DCP_WORLD_SIZE > 1 (VLLM_SM86_DCP): the target compressed-KV cache is
+    round-robin sharded across DCP ranks in compressed-entry space; non-owned
+    entries return before any store and owned entries are written at the
+    rank-LOCAL slot derived from the P1 sharded block table (shared P2
+    layout; identical formulas to the topk read path
+    ``sparse_attn_indexer._sm86_dcp_global_to_local`` +
+    ``compute_global_topk_indices_and_lens``). ``kv_slot_mapping_ptr`` is
+    unused in that mode. The compression math itself is unchanged and
+    identical on every rank (replicated fp32 state, global positions).
     """
     token_idx = tl.program_id(0)
 
@@ -166,6 +245,21 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
         return
 
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+
+    if DCP_WORLD_SIZE > 1:
+        # Global entry index of the block completed at `position` (global
+        # absolute position -- ARCHITECTURE.md section 10 rule 6). Entries
+        # are round-robin distributed across DCP ranks in
+        # DCP_ENTRY_INTERLEAVE-entry chunks; owned entries fill this rank's
+        # pages contiguously in local-entry order (shared P2 layout, same
+        # formulas as indexer.py::_sm86_dcp_compressed_slot_mapping and
+        # sparse_attn_indexer._sm86_dcp_global_to_local).
+        dcp_entry_idx = position // COMPRESS_RATIO
+        if (dcp_entry_idx // DCP_ENTRY_INTERLEAVE) % DCP_WORLD_SIZE != DCP_RANK:
+            return
+        dcp_local_entry = (
+            dcp_entry_idx // (DCP_ENTRY_INTERLEAVE * DCP_WORLD_SIZE)
+        ) * DCP_ENTRY_INTERLEAVE + dcp_entry_idx % DCP_ENTRY_INTERLEAVE
 
     # ── Gather state cache entries ────────────────────────────────────
     start = position - (1 + OVERLAP) * COMPRESS_RATIO + 1
@@ -219,9 +313,24 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     normed = compressed_kv * rrms * rms_w
 
     # ── KV cache pointers ────────────────────────────────────────────
-    kv_slot_idx = tl.load(kv_slot_mapping_ptr + token_idx)
-    if kv_slot_idx < 0:
-        return
+    if DCP_WORLD_SIZE > 1:
+        # Route the entry write through the P1 sharded block table: rank-
+        # local entries fill local pages contiguously
+        # (row = local_entry // storage_block_size). Non-owned entries
+        # already returned above.
+        dcp_block_number = tl.load(
+            kv_block_table_ptr
+            + req_idx * kv_block_table_stride
+            + dcp_local_entry // kv_cache_block_size
+        )
+        kv_slot_idx = (
+            dcp_block_number.to(tl.int64) * kv_cache_block_size
+            + dcp_local_entry % kv_cache_block_size
+        )
+    else:
+        kv_slot_idx = tl.load(kv_slot_mapping_ptr + token_idx)
+        if kv_slot_idx < 0:
+            return
     kv_block_idx = kv_slot_idx // kv_cache_block_size
     kv_pos_in_block = kv_slot_idx % kv_cache_block_size
 
@@ -677,6 +786,8 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     k_cache_ptr,
     kv_slot_mapping_ptr,
     kv_cache_block_size,
+    kv_block_table_ptr,  # unused (indexer writes via kv_slot_mapping)
+    kv_block_table_stride,  # unused
     # ── constexprs ──
     HEAD_SIZE: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
@@ -689,6 +800,9 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     TOKEN_STRIDE: tl.constexpr,  # 128 for indexer
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
     KV_BLOCK_STRIDE: tl.constexpr,
+    DCP_WORLD_SIZE: tl.constexpr = 1,
+    DCP_RANK: tl.constexpr = 0,
+    DCP_ENTRY_INTERLEAVE: tl.constexpr = 1,
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
 
@@ -701,6 +815,14 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     For head_dim=128 we have exactly one quant block, so we skip the
     [N_QUANT_BLOCKS, QUANT_BLOCK] reshape entirely and use a flat
     ``tl.max`` reduction.
+
+    DCP_WORLD_SIZE > 1 (VLLM_SM86_DCP): the FP8 indexer cache is round-robin
+    sharded across DCP ranks. Ownership is enforced arithmetically below
+    (non-owned entries return before any store, so a stale unsharded slot
+    mapping can never cause cross-rank double writes); the slot for owned
+    entries still comes from ``kv_slot_mapping_ptr``, which the indexer
+    metadata builder must produce DCP-aware (rank-local slots for owned
+    entries, -1 otherwise).
     """
     token_idx = tl.program_id(0)
 
@@ -711,6 +833,14 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     position = tl.load(positions_ptr + token_idx)
     if (position + 1) % COMPRESS_RATIO != 0:
         return
+
+    if DCP_WORLD_SIZE > 1:
+        # Entry-space ownership check, identical to the owned-mask inside
+        # indexer.py::_sm86_dcp_compressed_slot_mapping (global positions,
+        # ARCHITECTURE.md section 10 rule 6).
+        dcp_entry_idx = position // COMPRESS_RATIO
+        if (dcp_entry_idx // DCP_ENTRY_INTERLEAVE) % DCP_WORLD_SIZE != DCP_RANK:
+            return
 
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
 
@@ -853,6 +983,8 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     k_cache_ptr,
     kv_slot_mapping_ptr,
     kv_cache_block_size,
+    kv_block_table_ptr,  # unused (signature parity with the shared launcher)
+    kv_block_table_stride,  # unused
     # ── constexprs ──
     HEAD_SIZE: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
@@ -865,6 +997,11 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     TOKEN_STRIDE: tl.constexpr,  # HEAD_SIZE // 2 = 64 packed bytes/token
     SCALE_DIM: tl.constexpr,  # HEAD_SIZE // QUANT_BLOCK = 4 ue8m0 bytes/token
     KV_BLOCK_STRIDE: tl.constexpr,
+    # DCP is rejected for MXFP4 at the launcher (NotImplementedError); the
+    # constexprs exist only for signature parity with the shared launch.
+    DCP_WORLD_SIZE: tl.constexpr = 1,
+    DCP_RANK: tl.constexpr = 0,
+    DCP_ENTRY_INTERLEAVE: tl.constexpr = 1,
 ):
     """Fused compress → RMSNorm → RoPE → MXFP4 quant → store.
 

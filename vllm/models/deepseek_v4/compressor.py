@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -250,6 +251,35 @@ class DeepseekCompressor(nn.Module):
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.max_model_len = vllm_config.model_config.max_model_len
 
+        # VLLM_SM86_DCP (P2c cache-write path): the compressed-KV groups this
+        # module writes are round-robin sharded across DCP ranks, while the
+        # fp32 compressor state it reads (self.state_cache) stays replicated
+        # (dcp_exempt, P1). Every rank therefore computes every entry
+        # identically in fp32 (no collectives needed, capture-safe) and
+        # stores only the entries it owns. Gate unset or dcp==1 keeps the
+        # original path unchanged.
+        self._dcp_world_size = 1
+        self._dcp_rank = 0
+        if envs.VLLM_SM86_DCP:
+            try:
+                from vllm.distributed import get_dcp_group
+
+                self._dcp_world_size = get_dcp_group().world_size
+                self._dcp_rank = get_dcp_group().rank_in_group
+            except AssertionError:
+                # DCP group not initialized (single GPU / tests).
+                self._dcp_world_size = 1
+                self._dcp_rank = 0
+        self._dcp_interleave = (
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+        )
+        self._dcp_enabled = envs.VLLM_SM86_DCP and self._dcp_world_size > 1
+        if self._dcp_enabled and use_fp4_cache:
+            raise NotImplementedError(
+                "VLLM_SM86_DCP: the MXFP4 indexer cache has no DCP "
+                "write path (SM8x uses the FP8 indexer cache layout)."
+            )
+
         self.overlap = compress_ratio == 4
         self.coff = 1 + self.overlap
 
@@ -420,7 +450,19 @@ class DeepseekCompressor(nn.Module):
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
         # does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
-        if is_cutedsl_supported() and self.head_dim == 512:
+        if self._dcp_enabled:
+            # VLLM_SM86_DCP + dcp>1: the cutedsl and two-stage fused paths
+            # have no context-parallel layout support, so route to the
+            # Triton kernel (pure Python/Triton constraint -- no csrc
+            # edits). It performs the per-entry DCP ownership check and
+            # routes owned writes through the P1 sharded block table.
+            compress_norm_rope_store_fn = compress_norm_rope_store_triton
+            extra_kwargs: dict[str, Any] = {
+                "dcp_world_size": self._dcp_world_size,
+                "dcp_rank": self._dcp_rank,
+                "cp_kv_cache_interleave_size": self._dcp_interleave,
+            }
+        elif is_cutedsl_supported() and self.head_dim == 512:
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 compress_norm_rope_store_cutedsl,
             )

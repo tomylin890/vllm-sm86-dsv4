@@ -21,6 +21,14 @@ def save_partial_states(
     """Write packed [kv, score+ape] partial states into the compressor cache.
 
     One program per token; pads (slot_id == -1) are skipped.
+
+    DCP note (VLLM_SM86_DCP, P2c): the fp32 compressor-state group written
+    here is dcp_exempt (replicated) -- its BlockTable is built with
+    shard_dcp=False, so this slot_mapping is unsharded and every DCP rank
+    performs the identical write for every token. No DCP changes are needed
+    or allowed here. The ape bias below is indexed by the GLOBAL absolute
+    position (position % compress_ratio); it must never be renumbered
+    per-shard (ARCHITECTURE.md section 10, rule 6).
     """
     num_actual = slot_mapping.shape[0]
     head_size = kv.shape[-1]
