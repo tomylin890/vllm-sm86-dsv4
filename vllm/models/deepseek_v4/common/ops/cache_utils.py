@@ -15,7 +15,7 @@ preparation.
 """
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -31,7 +31,13 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import is_cutedsl_supported
 from vllm.utils.math_utils import next_power_of_2
+from vllm.v1.attention.backends.mla.sm86_dcp_layout import (
+    sm86_dcp_local_to_global,
+)
 from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32, _encode_fp8_u8
+
+if TYPE_CHECKING:
+    from vllm.distributed.parallel_state import GroupCoordinator
 
 
 @triton.jit
@@ -389,6 +395,200 @@ def dequantize_and_gather_k_cache_triton(
     )
 
 
+# --------------------------------------------------------------------------
+# P2d (SM8x DSV4 DCP, VLLM_SM86_DCP): compressed-shard all-gather for
+# prefill. Under DCP the compressed-KV cache holds only this rank's
+# round-robin shard of entries (owner(e) = (e // I) % W -- the shared P2
+# layout written by P2c and scored by P2b). The compressed prefix is tiny
+# (584 B/entry at C4A: a 128K-token prefix is ~19 MB/layer; C128A is 32x
+# smaller), so prefill all-gathers every rank's shard into a dense buffer in
+# GLOBAL entry order and runs the UNCHANGED prefill kernels against it with
+# the GLOBAL entry indices the P2b indexer merge already emits.
+# Rule 8 (ARCHITECTURE.md section 10): the fp8 payload and UE8M0 scales move
+# VERBATIM as bytes; dequantization happens exactly once, in the same
+# existing kernel the non-DCP path uses.
+# --------------------------------------------------------------------------
+
+_SM86_DCP_ENTRY_DATA_BYTES = 576  # 448 fp8 + 64 bf16 (128 bytes)
+_SM86_DCP_ENTRY_SCALE_BYTES = 8  # 7 UE8M0 scales + 1 pad
+_SM86_DCP_ENTRY_BYTES = _SM86_DCP_ENTRY_DATA_BYTES + _SM86_DCP_ENTRY_SCALE_BYTES
+_SM86_DCP_PACK_NUM_WORKERS = 128
+
+
+@triton.jit
+def _sm86_dcp_pack_k_entries_kernel(
+    staging_ptr,  # [num_reqs, max_local_entries, 584] uint8 contiguous
+    k_cache_ptr,  # paged cache (uint8 bytes)
+    local_lens_ptr,  # [num_reqs] int32: this rank's owned-entry counts
+    block_table_ptr,  # [num_reqs, max_blocks_per_seq] int32 (P1-sharded)
+    max_blocks_per_seq,
+    staging_stride0,
+    staging_stride1,
+    cache_block_size: tl.constexpr,  # entries per cache page (64 C4A / 2 C128A)
+    token_data_size: tl.constexpr,  # 576
+    scale_dim: tl.constexpr,  # 8
+    block_stride: tl.constexpr,  # cache bytes per page
+):
+    """Copy this rank's compressed entries out of the paged cache, VERBATIM.
+
+    Local entry ``j`` lives at page ``block_table[req][j // page_entries]``
+    offset ``j % page_entries`` -- exactly the layout P2c's DCP-aware insert
+    writes. Each staging row is ``[576 data bytes | 8 scale bytes]``, i.e. a
+    valid ``cache_block_size=1`` paged-cache block, so the existing
+    ``_dequantize_and_gather_k_kernel`` can read the gathered buffer without
+    any new dequant code (rule 8: bytes + scales move untouched).
+    """
+    batch_idx = tl.program_id(0)
+    worker_id = tl.program_id(1)
+    num_workers = tl.num_programs(1)
+
+    local_len = tl.load(local_lens_ptr + batch_idx)
+    for j in range(worker_id, local_len, num_workers):
+        block_in_seq = j // cache_block_size
+        pos_in_block = j % cache_block_size
+        physical_block_idx = tl.load(
+            block_table_ptr + batch_idx * max_blocks_per_seq + block_in_seq
+        )
+        # int64: physical_block_idx * block_stride can exceed 2^31 (matches
+        # the insert/gather kernels above).
+        cache_block_ptr = (
+            k_cache_ptr + physical_block_idx.to(tl.int64) * block_stride
+        )
+        token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
+        token_scale_ptr = (
+            cache_block_ptr
+            + cache_block_size * token_data_size
+            + pos_in_block * scale_dim
+        )
+        out_ptr = staging_ptr + batch_idx * staging_stride0 + j * staging_stride1
+
+        data_offsets = tl.arange(0, 64)
+        for chunk_idx in tl.static_range(token_data_size // 64):
+            vals = tl.load(token_data_ptr + chunk_idx * 64 + data_offsets)
+            tl.store(out_ptr + chunk_idx * 64 + data_offsets, vals)
+
+        scale_offsets = tl.arange(0, scale_dim)
+        scales = tl.load(token_scale_ptr + scale_offsets)
+        tl.store(out_ptr + token_data_size + scale_offsets, scales)
+
+
+def _sm86_dcp_allgather_dequantize_k_cache(
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    entry_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    offset: int,
+    dcp_group: "GroupCoordinator",
+    dcp_interleave: int,
+    max_entries: int,
+    use_fnuz: bool,
+) -> None:
+    """All-gather the DCP-sharded compressed entries; dequantize in GLOBAL order.
+
+    Steps (per prefill chunk; eager -- prefill is never captured):
+      1. pack this rank's local entries (verbatim fp8 bytes + UE8M0 scales)
+         into a contiguous ``[num_reqs, max_local, 584]`` staging buffer via
+         the P1-sharded block table;
+      2. all-gather the staging buffers over the DCP group (uint8, fixed
+         NCCL rank order); every shape below derives from GLOBAL seq lens,
+         so all ranks issue an identical, symmetric collective;
+      3. build a virtual ``cache_block_size=1`` block table over the
+         gathered buffer that maps GLOBAL entry ``e`` to the owning rank's
+         staging row via the shared inverse formula
+         ``sm86_dcp_local_to_global`` (single source of truth with
+         P2b/P2c -- never reimplemented here);
+      4. run the EXISTING dequant kernel against it: the dense bf16 output
+         lands in GLOBAL entry order, so the unchanged prefill pipeline
+         (combine_topk_swa_indices with P2b's GLOBAL topk indices +
+         sparse prefill attention) consumes it as if dcp were 1.
+
+    ``entry_lens`` are GLOBAL compressed-entry counts (``seq_lens //
+    compress_ratio``); ``max_entries`` is their chunk-wide max, computed
+    from CPU seq lens by the caller (rank-invariant).
+    """
+    # Lazy import: backends.utils is a large module; keep the default import
+    # path of this file lean (same pattern as the cutedsl import below).
+    from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+
+    world = dcp_group.world_size
+    rank = dcp_group.rank_in_group
+    num_reqs = entry_lens.shape[0]
+    device = out.device
+
+    # This rank's owned-entry count per request (base layout helper -- the
+    # same algebra as owner/local above, in count form).
+    local_lens = get_dcp_local_seq_lens(entry_lens, world, rank, dcp_interleave)
+
+    # Rank-invariant staging width: rank 0 always owns the most entries
+    # (base + min(rem, I)), so this bounds every rank's local count.
+    interleave_cycle = dcp_interleave * world
+    max_local = (
+        max_entries // interleave_cycle * dcp_interleave
+        + min(max_entries % interleave_cycle, dcp_interleave)
+    )
+    assert max_local > 0  # caller skips the max_entries == 0 case
+
+    staging = torch.empty(
+        (num_reqs, max_local, _SM86_DCP_ENTRY_BYTES),
+        dtype=torch.uint8,
+        device=device,
+    )
+    _sm86_dcp_pack_k_entries_kernel[(num_reqs, _SM86_DCP_PACK_NUM_WORKERS)](
+        staging,
+        k_cache,
+        local_lens,
+        block_table,
+        block_table.shape[-1],
+        staging.stride(0),
+        staging.stride(1),
+        cache_block_size=block_size,
+        token_data_size=_SM86_DCP_ENTRY_DATA_BYTES,
+        scale_dim=_SM86_DCP_ENTRY_SCALE_BYTES,
+        block_stride=k_cache.stride(0),
+    )
+
+    # [world * num_reqs, max_local, 584], rank-major (fixed NCCL rank order).
+    gathered = dcp_group.all_gather(staging, dim=0)
+    # Flat row of (rank r, request c, local j) = (r*num_reqs + c)*max_local + j.
+    gathered_rows = gathered.reshape(
+        world * num_reqs * max_local, _SM86_DCP_ENTRY_BYTES
+    )
+
+    # Virtual block table in GLOBAL entry order. sm86_dcp_local_to_global is
+    # a bijection (rank, local) -> global, and for every global e <
+    # max_entries the owning rank's local index is < max_local, so each of
+    # the max_entries slots is written exactly once (torch.empty is safe).
+    local_j = torch.arange(max_local, dtype=torch.int64, device=device)
+    row_base = torch.empty(max_entries, dtype=torch.int64, device=device)
+    for r in range(world):
+        global_e = sm86_dcp_local_to_global(local_j, r, world, dcp_interleave)
+        in_range = global_e < max_entries
+        row_base[global_e[in_range]] = (
+            r * num_reqs * max_local + local_j[in_range]
+        )
+    request_offsets = (
+        torch.arange(num_reqs, dtype=torch.int64, device=device) * max_local
+    )
+    virtual_block_table = (
+        row_base.unsqueeze(0) + request_offsets.unsqueeze(1)
+    ).to(torch.int32)
+
+    # Existing dequant kernel over the gathered buffer viewed as a
+    # cache_block_size=1 paged cache (each 584-byte row: 576 data + 8 scales
+    # at row offset 576 -- exactly what the kernel derives for block size 1).
+    dequantize_and_gather_k_cache_triton(
+        out,
+        gathered_rows,
+        seq_lens=entry_lens,
+        gather_lens=None,
+        block_table=virtual_block_table,
+        block_size=1,
+        offset=offset,
+        use_fnuz=use_fnuz,
+    )
+
+
 def dequantize_and_gather_k_cache(
     # [num_reqs, max_num_tokens, head_size]
     out: torch.Tensor,
@@ -403,6 +603,9 @@ def dequantize_and_gather_k_cache(
     block_size: int,
     offset: int,
     use_fnuz: bool = False,
+    dcp_group: "GroupCoordinator | None" = None,
+    dcp_interleave: int = 1,
+    dcp_max_entries: int | None = None,
 ) -> None:
     """Dequantize and gather a paged DSv4 K cache.
 
@@ -410,7 +613,46 @@ def dequantize_and_gather_k_cache(
     ``False`` for ``compressed_k_cache`` (Triton encoder is OCP everywhere),
     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
     writes FNUZ on gfx942 and OCP on gfx950).
+
+    DCP (VLLM_SM86_DCP, P2d): pass ``dcp_group`` (world > 1) when ``k_cache``
+    is a DCP-SHARDED compressed-KV cache read through a P1-sharded block
+    table. ``seq_lens`` must then be GLOBAL compressed-entry counts,
+    ``gather_lens`` must be None (the compressed gather always reads the
+    full prefix) and ``dcp_max_entries`` their chunk max (an int derived
+    from CPU seq lens, identical on all ranks). The entries are
+    all-gathered over the DCP group and dequantized into GLOBAL entry
+    order -- ``out`` is then bit-identical in meaning to the dcp=1 gather.
+    The replicated (dcp_exempt) SWA cache must NOT pass ``dcp_group``.
+    ``combine_topk_swa_indices`` needs no CP branch on this design: topk
+    indices stay GLOBAL and the gathered buffer is dense global order.
     """
+    if dcp_group is not None and dcp_group.world_size > 1:
+        assert gather_lens is None, (
+            "SM86 DCP compressed gather reads the full prefix; the "
+            "replicated SWA gather must not pass dcp_group."
+        )
+        assert dcp_max_entries is not None
+        if dcp_max_entries <= 0:
+            # No completed compressed entries anywhere in the chunk; the
+            # non-DCP path would gather nothing either. Skipped on every
+            # rank symmetrically (derived from global CPU seq lens).
+            return
+        # The cutedsl gather has no CP-layout support (and SM8x never takes
+        # it); the DCP branch always runs the Triton path.
+        _sm86_dcp_allgather_dequantize_k_cache(
+            out,
+            k_cache,
+            seq_lens,
+            block_table,
+            block_size,
+            offset,
+            dcp_group,
+            dcp_interleave,
+            dcp_max_entries,
+            use_fnuz,
+        )
+        return
+
     if is_cutedsl_supported():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
@@ -547,6 +789,17 @@ def combine_topk_swa_indices(
     N: int,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Concatenate topk compressed indices with SWA window indices.
+
+    DCP note (VLLM_SM86_DCP, P2d): deliberately NO CP branch. Under DCP the
+    prefill design all-gathers the compressed shards into a dense buffer in
+    GLOBAL entry order (see ``dequantize_and_gather_k_cache``) and the P2b
+    indexer merge emits GLOBAL entry indices, so the topk arithmetic here
+    (``e + M * batch``) is already correct; the SWA cache is replicated
+    (dcp_exempt), so the window arithmetic is unchanged too. The Lasimeri
+    reference localized both here only because it sharded the SWA cache and
+    ran local-KV prefill attention with an LSE merge -- a different design.
+    """
     num_tokens = topk_indices.shape[0]
     combined_topk = (
         (topk + window_size + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)

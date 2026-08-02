@@ -233,7 +233,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     entries return before any store and owned entries are written at the
     rank-LOCAL slot derived from the P1 sharded block table (shared P2
     layout; identical formulas to the topk read path
-    ``sparse_attn_indexer._sm86_dcp_global_to_local`` +
+    ``sm86_dcp_layout.sm86_dcp_global_to_local`` +
     ``compute_global_topk_indices_and_lens``). ``kv_slot_mapping_ptr`` is
     unused in that mode. The compression math itself is unchanged and
     identical on every rank (replicated fp32 state, global positions).
@@ -257,7 +257,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
         # DCP_ENTRY_INTERLEAVE-entry chunks; owned entries fill this rank's
         # pages contiguously in local-entry order (shared P2 layout, same
         # formulas as indexer.py::_sm86_dcp_compressed_slot_mapping and
-        # sparse_attn_indexer._sm86_dcp_global_to_local).
+        # sm86_dcp_layout.sm86_dcp_global_to_local).
         dcp_entry_idx = position // COMPRESS_RATIO
         if (dcp_entry_idx // DCP_ENTRY_INTERLEAVE) % DCP_WORLD_SIZE != DCP_RANK:
             return

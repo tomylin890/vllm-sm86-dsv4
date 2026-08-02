@@ -16,8 +16,14 @@ window), and emits raw PRE-sink partials ``(o, m, l)``.  The partials are
 merged in fp32 with a fixed rank order via the a2a LSE reduce, the attention
 sink is applied exactly once at the global max, and inverse RoPE follows
 later in ``_o_proj`` — after the merge (ARCHITECTURE.md section 10 rules
-1/2/9/10, section 6).  With the gate unset or dcp == 1 every path below
-falls through to the unchanged parent implementation.
+1/2/9/10, section 6).
+
+Compressed-layer PREFILL (P2d) takes the opposite shape: the compressed
+prefix is tiny, so each rank all-gathers the raw entry bytes of every shard
+into a dense GLOBAL-entry-order buffer and runs the unchanged single-softmax
+prefill pipeline against it (no output merge; replicated compute across the
+DCP group).  With the gate unset or dcp == 1 every path below falls through
+to the unchanged parent implementation.
 """
 
 import torch
@@ -30,17 +36,22 @@ from vllm.models.deepseek_v4.amd.rocm import (
     DeepseekV4ROCMAiterMLASparseBackend,
     DeepseekV4ROCMAiterMLASparseMetadata,
     DeepseekV4ROCMAiterSparseSWAMetadata,
+    combine_topk_swa_indices,
     compute_global_topk_ragged_indices_and_indptr,
 )
+from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
 from vllm.models.deepseek_v4.common.ops.dcp import (
     dcp_merge_flashmla_output,
     softmax_stats_to_lse,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     build_ragged_indices_from_dense,
     rocm_sparse_attn_decode,
+    rocm_sparse_attn_prefill,
 )
+from vllm.v1.worker.workspace import current_workspace_manager
 
 
 class DeepseekV4AmpereMLASparseBackend(DeepseekV4ROCMAiterMLASparseBackend):
@@ -133,28 +144,191 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
         attn_metadata: DeepseekV4ROCMAiterMLASparseMetadata | None,
         swa_metadata: DeepseekV4ROCMAiterSparseSWAMetadata,
     ) -> None:
-        if attn_metadata is not None and self._dcp_group_or_none() is not None:
-            # P2a implements the DECODE merge only.  Compressed-layer
-            # prefill reads the sharded compressed-KV cache through
-            # dequantize_and_gather_k_cache / combine_topk_swa_indices
-            # (common/ops/cache_utils.py), which have no CP-layout support
-            # in this base yet — running them against the P1-sharded block
-            # tables would silently gather wrong entries.  SWA-only layers
-            # (attn_metadata is None) prefill normally: their ring is
-            # replicated (dcp_exempt).  Tracked as a P2a blocker.
-            raise NotImplementedError(
-                "VLLM_SM86_DCP: compressed-layer prefill is not "
-                "context-parallel on the SM8x path yet."
+        dcp_group = None if attn_metadata is None else self._dcp_group_or_none()
+        if dcp_group is None:
+            # Default path — gate unset, dcp == 1, or a SWA-only layer
+            # (attn_metadata is None): the SWA ring is replicated
+            # (dcp_exempt), so SWA-only layers prefill normally.
+            super()._forward_prefill(
+                q=q,
+                positions=positions,
+                compressed_k_cache=compressed_k_cache,
+                swa_k_cache=swa_k_cache,
+                output=output,
+                attn_metadata=attn_metadata,
+                swa_metadata=swa_metadata,
             )
-        super()._forward_prefill(
+            return
+        self._forward_prefill_dcp(
             q=q,
-            positions=positions,
             compressed_k_cache=compressed_k_cache,
             swa_k_cache=swa_k_cache,
             output=output,
             attn_metadata=attn_metadata,
             swa_metadata=swa_metadata,
+            dcp_group=dcp_group,
         )
+
+    def _forward_prefill_dcp(
+        self,
+        q: torch.Tensor,
+        compressed_k_cache: torch.Tensor | None,
+        swa_k_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: DeepseekV4ROCMAiterMLASparseMetadata,
+        swa_metadata: DeepseekV4ROCMAiterSparseSWAMetadata,
+        dcp_group: "GroupCoordinator",
+    ) -> None:
+        """DCP compressed-layer prefill (P2d W1): gather, then run unchanged.
+
+        The compressed prefix is tiny (584 B/entry C4A — a 128K-token prefix
+        is ~19 MB/layer; C128A is 32x smaller), so instead of local-shard
+        attention + LSE merge (the Lasimeri approach, which additionally
+        requires the sharded-SWA index filtering that P1's replicated ring
+        makes impossible) each rank all-gathers the raw fp8 entries + UE8M0
+        scales of every shard over the DCP group, reordered into GLOBAL
+        entry order via the shared inverse layout formula (see
+        ``dequantize_and_gather_k_cache``'s DCP branch), and then runs the
+        EXISTING non-DCP prefill pipeline against the dense buffer:
+
+        - ``combine_topk_swa_indices`` consumes the GLOBAL entry indices the
+          P2b indexer prefill merge already emits (C4A) or the identity
+          ``[0..n-1]`` rows of the C128A prefill metadata — both index the
+          dense buffer directly, so it needs no CP branch;
+        - the replicated SWA gather and window arithmetic are unchanged
+          (rule 7);
+        - ``rocm_sparse_attn_prefill`` computes ONE full softmax per query
+          row over full information on every rank, so the attention sink is
+          applied exactly once per output (rule 1) and no cross-rank output
+          merge exists; each rank keeps its own TP heads (replicated
+          compute across the DCP group, identical by construction).
+
+        The body below is the parent ``_forward_prefill`` with only the
+        compressed-cache gather call changed (DCP kwargs); global absolute
+        positions/entry indices flow through untouched (rule 6), and the
+        bytes are dequantized exactly once in the existing kernel (rule 8).
+        """
+        if torch.cuda.is_current_stream_capturing():
+            # Prefill is never captured in production; guard the per-chunk
+            # allocations + collective against accidental capture (same
+            # eager-first policy as the decode branch).
+            raise RuntimeError(
+                "VLLM_SM86_DCP prefill is eager-only (per-chunk staging "
+                "buffers and DCP all-gather cannot be graph-captured)."
+            )
+        assert compressed_k_cache is not None
+
+        num_prefills = swa_metadata.num_prefills
+        num_prefill_tokens = swa_metadata.num_prefill_tokens
+        num_decodes = swa_metadata.num_decodes
+        num_decode_tokens = swa_metadata.num_decode_tokens
+
+        seq_lens = swa_metadata.prefill_seq_lens
+        gather_lens = swa_metadata.prefill_gather_lens
+        assert seq_lens is not None
+        assert gather_lens is not None
+        # CPU twin for the chunk-max entry count (rank-invariant; avoids a
+        # GPU sync per chunk).
+        seq_lens_cpu = swa_metadata.prefill_seq_lens_cpu
+        assert seq_lens_cpu is not None
+
+        query_start_loc_cpu = swa_metadata.query_start_loc_cpu
+        query_start_loc = swa_metadata.query_start_loc
+        assert query_start_loc_cpu is not None
+        assert query_start_loc is not None
+        prefill_token_base = query_start_loc_cpu[num_decodes]
+
+        if self.compress_ratio == 4:
+            assert self.topk_indices_buffer is not None
+            topk_indices = self.topk_indices_buffer[num_decode_tokens:]
+            topk_indices = topk_indices[:num_prefill_tokens]
+        else:
+            topk_indices = attn_metadata.c128a_prefill_topk_indices
+        assert topk_indices is not None
+        top_k = topk_indices.shape[-1]
+        N = (self.max_model_len + self.compress_ratio - 1) // self.compress_ratio
+
+        M = N + self.window_size + self.max_num_batched_tokens
+        num_chunks = (num_prefills + self.PREFILL_CHUNK_SIZE - 1) // (
+            self.PREFILL_CHUNK_SIZE
+        )
+
+        workspace_manager = current_workspace_manager()
+        kv = workspace_manager.get_simultaneous(
+            ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+        )[0]
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * self.PREFILL_CHUNK_SIZE
+            chunk_end = min(chunk_start + self.PREFILL_CHUNK_SIZE, num_prefills)
+            chunk_size = chunk_end - chunk_start
+
+            block_table = attn_metadata.block_table[num_decodes:]
+            # DCP delta vs the parent: the compressed cache holds only this
+            # rank's shard; all-gather + reorder to GLOBAL entry order
+            # inside the gather (chunk max entries from CPU seq lens keeps
+            # the collective shape identical on every rank).
+            max_entries = int(
+                seq_lens_cpu[chunk_start:chunk_end].max().item()
+            ) // self.compress_ratio
+            dequantize_and_gather_k_cache(
+                kv[:chunk_size],
+                compressed_k_cache,
+                seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
+                gather_lens=None,
+                block_table=block_table[chunk_start:chunk_end],
+                block_size=attn_metadata.block_size // self.compress_ratio,
+                offset=0,
+                use_fnuz=False,
+                dcp_group=dcp_group,
+                dcp_interleave=self._cp_interleave,
+                dcp_max_entries=max_entries,
+            )
+
+            # Replicated (dcp_exempt) SWA cache: unchanged parent code.
+            swa_block_table = swa_metadata.block_table[num_decodes:]
+            dequantize_and_gather_k_cache(
+                kv[:chunk_size],
+                swa_k_cache,
+                seq_lens=seq_lens[chunk_start:chunk_end],
+                gather_lens=gather_lens[chunk_start:chunk_end],
+                block_table=swa_block_table[chunk_start:chunk_end],
+                block_size=swa_metadata.block_size,
+                offset=N,
+                use_fnuz=current_platform.is_fp8_fnuz(),
+            )
+
+            query_start = (
+                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
+            )
+            query_end = (
+                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+            )
+
+            combined_indices, combined_lens = combine_topk_swa_indices(
+                topk_indices[query_start:query_end],
+                query_start_loc[
+                    num_decodes + chunk_start : num_decodes + chunk_end + 1
+                ],
+                seq_lens[chunk_start:chunk_end],
+                gather_lens[chunk_start:chunk_end],
+                self.window_size,
+                self.compress_ratio,
+                top_k,
+                M,
+                N,
+            )
+            rocm_sparse_attn_prefill(
+                q=q[query_start:query_end],
+                kv=kv.view(-1, 1, q.shape[-1]),
+                indices=combined_indices,
+                topk_length=combined_lens,
+                scale=self.scale,
+                head_dim=self.head_dim,
+                nope_head_dim=self.nope_head_dim,
+                rope_head_dim=self.rope_head_dim,
+                attn_sink=self.attn_sink,
+                output=output[query_start:query_end],
+            )
 
     def _forward_decode(
         self,

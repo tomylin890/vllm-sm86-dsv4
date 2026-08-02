@@ -34,6 +34,11 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerMetadata,
 )
+from vllm.v1.attention.backends.mla.sm86_dcp_layout import (
+    sm86_dcp_global_to_local,
+    sm86_dcp_local_to_global,
+    sm86_dcp_owns,
+)
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.attention.ops.mqa_logits_triton import (
     fp8_mqa_logits_triton,
@@ -140,70 +145,14 @@ def _merge_dcp_topk_global(
 # under the interleave-aware round-robin DCP layout
 # (owner(e) = (e // interleave) % world); "global" indices are absolute
 # compressed-entry positions. -1 is the invalid sentinel throughout.
+#
+# P2d refactor (no logic change): the pure ownership algebra
+# (sm86_dcp_local_to_global / sm86_dcp_owns / sm86_dcp_global_to_local)
+# moved verbatim to vllm/v1/attention/backends/mla/sm86_dcp_layout.py so
+# the prefill all-gather (cache_utils.py) shares the exact same formulas.
 # --------------------------------------------------------------------------
 
 _SM86_DCP_INVALID_SCORE = float("-inf")
-
-
-def _sm86_dcp_local_to_global(
-    local_indices: torch.Tensor,
-    dcp_rank: int,
-    dcp_world_size: int,
-    cp_interleave: int,
-) -> torch.Tensor:
-    """Map rank-local compressed-entry indices to global entry indices.
-
-    Mirrors the Lasimeri ContextParallelLayout.local_to_global formula;
-    -1 passes through unchanged.
-    """
-    safe = torch.clamp(local_indices, min=0)
-    global_indices = (
-        (safe // cp_interleave) * (cp_interleave * dcp_world_size)
-        + dcp_rank * cp_interleave
-        + safe % cp_interleave
-    )
-    return torch.where(
-        local_indices >= 0,
-        global_indices,
-        torch.full_like(global_indices, -1),
-    )
-
-
-def _sm86_dcp_owns(
-    global_indices: torch.Tensor,
-    dcp_rank: int,
-    dcp_world_size: int,
-    cp_interleave: int,
-) -> torch.Tensor:
-    """True where this rank owns the global compressed-entry index (>= 0)."""
-    safe = torch.clamp(global_indices, min=0)
-    owner = (safe // cp_interleave) % dcp_world_size
-    return (global_indices >= 0) & (owner == dcp_rank)
-
-
-def _sm86_dcp_global_to_local(
-    global_indices: torch.Tensor,
-    dcp_rank: int,
-    dcp_world_size: int,
-    cp_interleave: int,
-) -> torch.Tensor:
-    """Map global entry indices to this rank's local indices.
-
-    Exact inverse of _sm86_dcp_local_to_global for indices this rank owns;
-    callers must mask non-owned entries (the formula returns the local
-    PREFIX COUNT for those, matching get_dcp_local_seq_lens semantics).
-    -1 passes through unchanged.
-    """
-    safe = torch.clamp(global_indices, min=0)
-    rank_stride = dcp_world_size * cp_interleave
-    base = safe // rank_stride * cp_interleave
-    remainder = safe - base * dcp_world_size
-    extra = torch.clamp(remainder - dcp_rank * cp_interleave, 0, cp_interleave)
-    return torch.where(
-        global_indices >= 0,
-        base + extra,
-        torch.full_like(global_indices, -1),
-    )
 
 
 def _sm86_dcp_global_topk(
@@ -314,7 +263,7 @@ def _sm86_dcp_topk_prefill(
             dtype=torch.int32,
             device=local_topk_indices.device,
         )
-    global_candidates = _sm86_dcp_local_to_global(
+    global_candidates = sm86_dcp_local_to_global(
         local_indices, dcp_rank, dcp_world_size, cp_interleave
     )
     _, top_indices = _sm86_dcp_global_topk(
@@ -362,13 +311,13 @@ def _sm86_dcp_topk_decode(
         local_topk_indices,
         torch.full_like(local_topk_indices, -1),
     )
-    global_candidates = _sm86_dcp_local_to_global(
+    global_candidates = sm86_dcp_local_to_global(
         masked_local, dcp_rank, dcp_world_size, cp_interleave
     )
     global_values, global_indices = _sm86_dcp_global_topk(
         local_values, global_candidates, topk_tokens
     )
-    owned = _sm86_dcp_owns(global_indices, dcp_rank, dcp_world_size, cp_interleave)
+    owned = sm86_dcp_owns(global_indices, dcp_rank, dcp_world_size, cp_interleave)
     owned_values = torch.where(
         owned,
         global_values,
@@ -379,7 +328,7 @@ def _sm86_dcp_topk_decode(
     owned_order = torch.argsort(owned_values, dim=-1, descending=True, stable=True)
     owned_sorted = torch.gather(owned, -1, owned_order)
     global_sorted = torch.gather(global_indices, -1, owned_order)
-    local_out = _sm86_dcp_global_to_local(
+    local_out = sm86_dcp_global_to_local(
         global_sorted, dcp_rank, dcp_world_size, cp_interleave
     )
     return torch.where(
