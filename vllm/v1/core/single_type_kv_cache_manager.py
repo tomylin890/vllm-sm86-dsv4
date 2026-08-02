@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheSpec,
+    KVCacheSpecKind,
     MambaSpec,
     MLAAttentionSpec,
     RSWASpec,
@@ -29,6 +30,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     TQFullAttentionSpec,
+    get_kv_cache_spec_kind,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -76,8 +78,16 @@ class SingleTypeKVCacheManager(ABC):
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
+        # Kind-based (not isinstance) to stay robust if a caller ever hands
+        # this manager a UniformTypeKVCacheSpecs-wrapped spec (the worker
+        # side already does; get_kv_cache_spec_kind recurses the wrapper).
         if dcp_world_size > 1 and not (
-            envs.VLLM_SM86_DCP and isinstance(kv_cache_spec, SlidingWindowSpec)
+            envs.VLLM_SM86_DCP
+            and get_kv_cache_spec_kind(kv_cache_spec)
+            in (
+                KVCacheSpecKind.SLIDING_WINDOW,
+                KVCacheSpecKind.SLIDING_WINDOW_MLA,
+            )
         ):
             # Under DCP each rank stores 1/dcp of a group's tokens, so one
             # logical block covers block_size * dcp tokens.

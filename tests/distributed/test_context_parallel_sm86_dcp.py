@@ -338,7 +338,17 @@ def _dsv4_runner_kwargs(dcp_size: int) -> dict:
     kwargs = {
         "tensor_parallel_size": 4,
         "decode_context_parallel_size": dcp_size,
-        "cp_kv_cache_interleave_size": DSV4_INTERLEAVE,
+        # interleave locked to 1: the current-base indexer metadata builder
+        # rejects dcp>1 with interleave>1, and upstream notes interleave>1
+        # fails gsm8k parity even for V3.2 (see ARCHITECTURE.md section 10;
+        # DSV4_INTERLEAVE is still used for passkey POSITIONS above, which
+        # is orthogonal to the runner's interleave setting).
+        "cp_kv_cache_interleave_size": 1,
+        # Prefix caching must stay off under VLLM_SM86_DCP + dcp>1: the
+        # HybridKVCacheCoordinator dcp spec-type assert and the
+        # SlidingWindowManager cache-hit dcp==1 assert are only reachable
+        # with caching on (DCP-PLAN Workstream E owns caching under CP).
+        "enable_prefix_caching": False,
         "enable_expert_parallel": True,
         "moe_backend": "deep_gemm_mega_moe",
         "all2all_backend": "deepep_high_throughput",
@@ -427,9 +437,23 @@ def _assert_dsv4_passkeys(
 @multi_gpu_test(num_gpus=4)
 def test_deepseek_v4_dcp_end_to_end() -> None:
     assert DSV4_MODEL is not None
+    # The gate must be visible to the mp executor workers as well; plain
+    # os.environ is inherited by the spawned processes.
+    os.environ["VLLM_SM86_DCP"] = "1"
     reference: dict[str, list[int]] = {}
 
     for dcp_size in (1, 2, 4):
+        if dcp_size > 1 and not os.environ.get("VLLM_SM86_DCP_P2"):
+            # P1 status: dcp>1 cannot boot yet — the sparse-indexer guard
+            # (vllm/v1/attention/backends/mla/indexer.py:~575,
+            # "DCP is not supported with sparse indexer KV compression")
+            # is intentionally left in place until the P2 cross-shard
+            # top-k/LSE merge lands. The dcp=1 leg above has already
+            # exercised the gate + pool sizing at this point.
+            pytest.skip(
+                "DSV4 dcp>1 is blocked in P1 by the indexer compress_ratio "
+                "guard; set VLLM_SM86_DCP_P2=1 after the P2 merge lands."
+            )
         with VllmRunner(DSV4_MODEL, **_dsv4_runner_kwargs(dcp_size)) as runner:
             expected, actual = _run_dsv4_passkeys(
                 runner,

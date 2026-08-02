@@ -7274,8 +7274,17 @@ class GPUModelRunner(
                 slot_mapping_modes.append(SlotMappingMode.NONE)
             else:
                 slot_mapping_modes.append(SlotMappingMode.TOKEN_TO_KV_SLOT)
+            # Kind-based (not isinstance) on purpose: DSV4 worker groups
+            # arrive wrapped in UniformTypeKVCacheSpecs, and
+            # get_kv_cache_spec_kind recurses through the wrapper while an
+            # isinstance check on the wrapper would silently never match.
             dcp_exempt.append(
-                envs.VLLM_SM86_DCP and isinstance(kv_cache_spec, SlidingWindowSpec)
+                envs.VLLM_SM86_DCP
+                and kv_cache_spec_kind
+                in (
+                    KVCacheSpecKind.SLIDING_WINDOW,
+                    KVCacheSpecKind.SLIDING_WINDOW_MLA,
+                )
             )
             # For exempt groups SlidingWindowSpec.max_num_blocks_per_req
             # returns full unsharded rows under the gate, matching the

@@ -54,7 +54,12 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheSpecKind,
+    MambaSpec,
+    get_kv_cache_spec_kind,
+)
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
@@ -450,6 +455,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         max_num_blocks_per_group = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
+            # VLLM_SM86_DCP dcp_exempt replication (sliding-window groups
+            # stay unsharded under DCP) is only wired in the default V1
+            # gpu_model_runner; this V2 runner unconditionally shards every
+            # group's block-table width by dcp below. Fail closed instead of
+            # silently splitting the SWA window / fp32 compressor state.
+            if (
+                envs.VLLM_SM86_DCP
+                and self.dcp_size > 1
+                and get_kv_cache_spec_kind(spec)
+                in (
+                    KVCacheSpecKind.SLIDING_WINDOW,
+                    KVCacheSpecKind.SLIDING_WINDOW_MLA,
+                )
+            ):
+                raise NotImplementedError(
+                    "VLLM_SM86_DCP hybrid DCP (dcp_exempt sliding-window "
+                    "replication) is not implemented in the V2 gpu model "
+                    "runner; use the default model runner."
+                )
             block_sizes.append(spec.block_size)
             # When using DCP, each request's KV cache is sharded among different ranks.
             # As a result, one block on the current rank covers `block_size * cp_size`
