@@ -124,6 +124,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_SM86_DCP: bool = False
+    VLLM_SM86_DET_TOPK: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
@@ -1181,6 +1182,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # are byte-for-byte unchanged when this is unset.
     "VLLM_SM86_DCP": lambda: (
         os.getenv("VLLM_SM86_DCP", "False").lower() in ("true", "1")
+    ),
+    # DEBUG ONLY (P2e): replace every DeepSeek sparse-indexer top-k selection
+    # (top_k_per_row_prefill / top_k_per_row_decode / persistent_topk /
+    # cooperative_topk) with a deterministic pure-torch stable-sort selector
+    # (score desc, ties broken by lower index) -- see
+    # vllm/v1/attention/ops/sm86_det_topk.py.
+    # Deliberately NOT named *_DCP_*: the compiled selectors resolve their
+    # threshold bin with atomics, so massive exact-0.0 indexer score ties make
+    # selection nondeterministic run-to-run ALREADY AT dcp=1. This flag applies
+    # at every dcp world size so that dcp=1 and dcp>1 share bit-identical
+    # selection arithmetic and a token-for-token A/B is meaningful. Very slow;
+    # never enable in production. Default off: all default code paths are
+    # byte-for-byte unchanged when this is unset.
+    "VLLM_SM86_DET_TOPK": lambda: (
+        os.getenv("VLLM_SM86_DET_TOPK", "False").lower() in ("true", "1")
     ),
     # Optional: enable external Oink custom ops (e.g., Blackwell RMSNorm).
     # Disabled by default.

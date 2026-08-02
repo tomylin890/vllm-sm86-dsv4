@@ -44,6 +44,11 @@ from vllm.v1.attention.ops.mqa_logits_triton import (
     fp8_mqa_logits_triton,
     fp8_paged_mqa_logits_triton,
 )
+from vllm.v1.attention.ops.sm86_det_topk import (
+    det_top_k_per_row_decode,
+    det_top_k_per_row_flat_lengths,
+    det_top_k_per_row_prefill,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
@@ -736,16 +741,31 @@ def sparse_attn_indexer(
                         clean_logits=False,
                     )
                 num_rows = logits.shape[0]
-                ops.top_k_per_row_prefill(
-                    logits,
-                    cu_seqlen_ks,
-                    cu_seqlen_ke,
-                    topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    topk_tokens,
-                )
+                if envs.VLLM_SM86_DET_TOPK:
+                    # P2e debug gate: deterministic pure-torch selection
+                    # (score desc, ties by lower index). Same band
+                    # (cu_seqlen_ks/ke), same band-relative int32 output with
+                    # -1 padding, so both the plain dcp=1 path and the P2b
+                    # per-rank local selection below consume it unchanged.
+                    det_top_k_per_row_prefill(
+                        logits,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                        topk_indices,
+                        num_rows,
+                        topk_tokens,
+                    )
+                else:
+                    ops.top_k_per_row_prefill(
+                        logits,
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                        topk_indices,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        topk_tokens,
+                    )
 
             if attn_metadata_narrowed.use_sm86_dcp_topk:
                 # P2b SM8x DSV4 DCP path (VLLM_SM86_DCP): pure-torch
@@ -888,7 +908,34 @@ def sparse_attn_indexer(
             1024,
             2048,
         )
-        if use_cooperative_topk:
+        if envs.VLLM_SM86_DET_TOPK:
+            # P2e debug gate: deterministic selection replaces whichever of
+            # the three decode kernels below would have run. They agree on
+            # output (absolute int32 column indices, -1 padded) and differ
+            # only in how the per-row column bound is derived, so mirror the
+            # dispatch: cooperative_topk/persistent_topk always flat-index
+            # `lengths` per row (no next_n argument), while
+            # top_k_per_row_decode applies the 1-D speculative-offset rule
+            # unless seq_lens is 2-D. At this call site seq_lens is always
+            # 2-D (B, next_n), so all three coincide. The P2b merge below
+            # consumes the result unchanged.
+            if use_cooperative_topk or use_persistent_topk:
+                det_top_k_per_row_flat_lengths(
+                    logits,
+                    seq_lens,
+                    topk_indices,
+                    topk_tokens,
+                )
+            else:
+                det_top_k_per_row_decode(
+                    logits,
+                    next_n,
+                    seq_lens,
+                    topk_indices,
+                    num_rows,
+                    topk_tokens,
+                )
+        elif use_cooperative_topk:
             workspace_manager = current_workspace_manager()
             (topk_workspace,) = workspace_manager.get_simultaneous(
                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),

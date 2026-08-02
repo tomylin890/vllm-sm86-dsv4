@@ -20,6 +20,10 @@ from vllm.v1.attention.ops.fp8_sm80 import (
     _decode_fp8_lut,
     get_e4m3fn_bf16_lut,
 )
+from vllm.v1.attention.ops.sm86_det_topk import (
+    det_top_k_per_row_decode,
+    det_top_k_per_row_prefill,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if current_platform.is_rocm():
@@ -752,16 +756,29 @@ def rocm_aiter_sparse_attn_indexer(
 
             num_rows = logits.shape[0]
 
-            torch.ops._C.top_k_per_row_prefill(
-                logits,
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                topk_indices,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                topk_tokens,
-            )
+            if envs.VLLM_SM86_DET_TOPK:
+                # P2e debug gate: deterministic pure-torch selection
+                # (score desc, ties by lower index), identical band
+                # (cu_seqlen_ks/ke), band-relative int32 output, -1 padded.
+                det_top_k_per_row_prefill(
+                    logits,
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    topk_indices,
+                    num_rows,
+                    topk_tokens,
+                )
+            else:
+                torch.ops._C.top_k_per_row_prefill(
+                    logits,
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    topk_indices,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens,
+                )
 
     if has_decode:
         decode_metadata = layer_attn_metadata.decode
@@ -801,16 +818,30 @@ def rocm_aiter_sparse_attn_indexer(
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
         num_rows = logits.shape[0]
 
-        torch.ops._C.top_k_per_row_decode(
-            logits,
-            next_n,
-            decode_metadata.seq_lens,
-            topk_indices,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
-            topk_tokens,
-        )
+        if envs.VLLM_SM86_DET_TOPK:
+            # P2e debug gate: deterministic pure-torch selection. seq_lens is
+            # 1-D here (asserted above), so det_top_k_per_row_decode applies
+            # the kernel's own speculative-offset bound
+            # max(0, seq_len - next_n + j + 1) per row.
+            det_top_k_per_row_decode(
+                logits,
+                next_n,
+                decode_metadata.seq_lens,
+                topk_indices,
+                num_rows,
+                topk_tokens,
+            )
+        else:
+            torch.ops._C.top_k_per_row_decode(
+                logits,
+                next_n,
+                decode_metadata.seq_lens,
+                topk_indices,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+                topk_tokens,
+            )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
