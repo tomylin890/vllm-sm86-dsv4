@@ -843,7 +843,18 @@ class DeepseekV4Indexer(nn.Module):
         attn_metadata = get_forward_context().attn_metadata
         if isinstance(attn_metadata, dict):
             indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
-            if indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens:
+            # The fast path emits GLOBAL entry ids; under VLLM_SM86_DCP with
+            # dcp > 1 the decode consumer (ampere_sparse._forward_decode_dcp)
+            # reads this buffer as rank-LOCAL prefix-compact coordinates, so
+            # the shortcut must yield to the DCP-aware producer in
+            # sparse_attn_indexer (_sm86_dcp_topk_{prefill,decode}).  Without
+            # this, each rank walks global ids through its 1/W-width sharded
+            # block table and attends (W-1)/W stale/null slots.
+            if (
+                not getattr(indexer_metadata, "use_sm86_dcp_topk", False)
+                and indexer_metadata.max_seq_len // self.compress_ratio
+                <= self.topk_tokens
+            ):
                 # candidates num smaller than topk, every candidate is selected
                 # but we still need to build k cache
                 compressor(compressed_kv_score, positions, rotary_emb)

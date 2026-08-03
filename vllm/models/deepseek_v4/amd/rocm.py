@@ -207,6 +207,7 @@ def _pack_global_topk_ragged_kernel(
     block_size,
     topk,
     BLOCK_SIZE: tl.constexpr,
+    max_blocks_per_req: tl.constexpr = 0,
 ):
     token_idx = tl.program_id(0)
     block_idx = tl.program_id(1)
@@ -227,6 +228,13 @@ def _pack_global_topk_ragged_kernel(
     )
     valid = mask & (local_idx >= 0)
     block_indices = local_idx // block_size
+    if max_blocks_per_req > 0:
+        # Defense in depth: an index past this request's allocated block-table
+        # columns can only come from a producer/consumer coordinate mismatch
+        # (see the DCP fast-path note in attention.py).  Reading it would walk
+        # the zero-initialised row tail into the never-written null block, i.e.
+        # attend stale pool bytes silently.  Drop instead.
+        valid = valid & (block_indices < max_blocks_per_req)
     block_numbers = tl.load(
         block_table_ptr + req_idx * block_table_stride + block_indices,
         mask=valid,
@@ -277,6 +285,7 @@ def compute_global_topk_ragged_indices_and_indptr(
             block_size,
             topk,
             BLOCK_SIZE=block,
+            max_blocks_per_req=block_table.shape[-1],
         )
     return global_topk_ragged, topk_indptr, topk_lens
 
