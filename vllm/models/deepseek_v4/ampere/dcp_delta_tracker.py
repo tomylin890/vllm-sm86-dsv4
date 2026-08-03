@@ -127,8 +127,24 @@ class Sm86DcpDeltaTracker:
     @classmethod
     def gc_all(cls, live_prefill_req_ids: "list[str]") -> None:
         """Step-level GC over every layer's tracker (rank-symmetric)."""
+        freed_any = False
         for tracker in cls._instances:
+            before = len(tracker._states)
             tracker.gc(live_prefill_req_ids)
+            freed_any = freed_any or len(tracker._states) < before
+        if freed_any:
+            # Request boundary: hundreds of MiB of staging plus a long
+            # prefill's transients were just freed, but the caching
+            # allocator pins freed blocks to the stream that used them
+            # (DSV4 runs dual streams via maybe_execute_in_parallel) and
+            # graph pools are separate, so the NEXT long request's first
+            # allocations can OOM with gigabytes 'reserved but
+            # unallocated' (observed: 16 MiB requests failing on the 2nd
+            # consecutive 200k prompt). empty_cache() syncs the free
+            # events and returns the blocks to CUDA. Runs once per
+            # request transition on the eager prefill path -- never under
+            # capture -- and is a local op on every rank (no collective).
+            torch.cuda.empty_cache()
 
     def gc(self, live_prefill_req_ids: "list[str]") -> None:
         """Free every tracked id absent from the current step's prefill rows."""
