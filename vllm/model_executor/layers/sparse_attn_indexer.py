@@ -749,6 +749,38 @@ def sparse_attn_indexer(
         for chunk in prefill_metadata.chunks:
             cu_seqlen_ks = chunk.cu_seqlen_ks
             cu_seqlen_ke = chunk.cu_seqlen_ke
+            # P2b row-count contract. Four independent row counts meet in this
+            # loop body:
+            #   span  = chunk.token_end - chunk.token_start   (descriptor)
+            #   ks    = cu_seqlen_ks rows                     (built == span)
+            #   sel   = topk_indices_buffer[start:end] rows   (== span iff
+            #           token_end <= max_num_batched_tokens; slicing clamps
+            #           SILENTLY otherwise)
+            #   qrows = q_quant[start:end] rows               (this forward's
+            #           token count -- the only free variable)
+            # _sm86_dcp_topk_prefill re-derives rows from `sel` while the
+            # top-k kernels use `qrows`; any divergence detonates downstream
+            # as an opaque broadcast/gather error with no context. Host ints
+            # only (no device work, no sync); every DCP rank evaluates the
+            # same values so ranks fail together and merge collectives stay
+            # symmetric. Prefill is never captured under FULL_DECODE_ONLY.
+            _span = chunk.token_end - chunk.token_start
+            _ks = cu_seqlen_ks.shape[0]
+            _sel = max(0, min(topk_indices_buffer.shape[0], chunk.token_end)
+                       - chunk.token_start)
+            _qrows = max(0, min(q_quant.shape[0], chunk.token_end)
+                         - chunk.token_start)
+            if not (_span == _ks == _sel == _qrows):
+                raise RuntimeError(
+                    "SM8x DCP indexer prefill chunk row-count contract "
+                    f"violated: layer={k_cache_prefix} span={_span} "
+                    f"(token_start={chunk.token_start} "
+                    f"token_end={chunk.token_end}) cu_seqlen_ks={_ks} "
+                    f"topk_sel_rows={_sel} q_rows={_qrows} "
+                    f"q_quant_rows={q_quant.shape[0]} "
+                    f"topk_buffer_rows={topk_indices_buffer.shape[0]} "
+                    f"num_tokens={hidden_states.shape[0]}"
+                )
             assert chunk.local_cu_seq_lens is not None
             k_quant = k_quant_full[: chunk.max_local_total_seq_lens]
             k_scale = k_scale_full[: chunk.max_local_total_seq_lens]

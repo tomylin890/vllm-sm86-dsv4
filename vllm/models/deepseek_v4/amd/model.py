@@ -563,9 +563,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         self.device = current_platform.device_type
         # Reserved topk indices buffer for all Indexer layers to reuse.
-        self.topk_indices_buffer = torch.empty(
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            config.index_topk,
+        # Fail CLOSED: only [: num_tokens] is re-cleared per forward, so with
+        # torch.empty the rows in [num_tokens, max_num_batched_tokens) would
+        # hold a PREVIOUS request's top-k selections forever -- any slice
+        # reaching past this forward's token count then aliases stale indices
+        # instead of the -1 "no token" sentinel every consumer expects. One
+        # fill at boot; zero steady-state cost.
+        self.topk_indices_buffer = torch.full(
+            (
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                config.index_topk,
+            ),
+            fill_value=-1,
             dtype=torch.int32,
             device=self.device,
         )
