@@ -56,6 +56,8 @@ def compress_norm_rope_store_triton(
     dcp_world_size: int = 1,
     dcp_rank: int = 0,
     cp_kv_cache_interleave_size: int = 1,
+    state_window: int = 0,
+    kv_slot_mapping: torch.Tensor | None = None,
 ) -> None:
     """Shared triton launcher for the fused compress+norm+RoPE+insert path.
 
@@ -93,6 +95,24 @@ def compress_norm_rope_store_triton(
       builder's DCP-aware compressed slot mapping
       (indexer.py::_sm86_dcp_compressed_slot_mapping), which implements the
       identical formula.
+
+    P8 (``state_window > 0``, VLLM_DSV4_COMPRESSOR_WINDOWED): the fp32
+    compressor state is placed in a ``state_window``-token RING -- state row
+    for absolute position ``p`` lives at ring slot ``p % state_window``
+    (``block_table.py::_compute_slot_mapping_kernel`` applies the identical
+    modulo when it builds ``slot_mapping``, so writes and reads agree). The
+    gather below therefore folds its ``[position - L + 1, position]`` lookback
+    into the ring before indexing the block table. Nothing else changes: the
+    rows loaded for a given logical position hold the same bytes as the
+    default placement, so the compression math is bit-identical. ``0`` (the
+    default) is the pre-P8 absolute-position addressing, dead code at compile
+    time.
+
+    ``kv_slot_mapping`` overrides ``k_cache_metadata.slot_mapping`` for the
+    compressed-entry write. It exists because the P8 windowed dispatch calls
+    this launcher on a SLICE ``[a:b)`` of the flat token axis, and every
+    token-indexed tensor must be sliced consistently. ``None`` (the default)
+    reads the metadata's own mapping, exactly as before.
     """
     if head_dim == 512:
         kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
@@ -148,7 +168,11 @@ def compress_norm_rope_store_triton(
         cos_sin_cache.stride(0),
         # KV cache
         kv_cache,
-        k_cache_metadata.slot_mapping,
+        (
+            k_cache_metadata.slot_mapping
+            if kv_slot_mapping is None
+            else kv_slot_mapping
+        ),
         kv_cache.shape[1],  # paged KV cache block size (tokens per block)
         # constexprs
         HEAD_SIZE=head_dim,
@@ -165,6 +189,7 @@ def compress_norm_rope_store_triton(
         DCP_WORLD_SIZE=dcp_world_size,
         DCP_RANK=dcp_rank,
         DCP_ENTRY_INTERLEAVE=dcp_entry_interleave,
+        STATE_WINDOW=state_window,
         kv_block_table_ptr=kv_block_table,
         kv_block_table_stride=kv_block_table_stride,
         num_warps=num_warps,
@@ -213,6 +238,10 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     DCP_WORLD_SIZE: tl.constexpr = 1,
     DCP_RANK: tl.constexpr = 0,
     DCP_ENTRY_INTERLEAVE: tl.constexpr = 1,
+    # P8: fp32 compressor-state ring capacity in tokens; 0 == absolute
+    # position addressing (the pre-P8 behavior, and dead code at compile
+    # time under the default specialization).
+    STATE_WINDOW: tl.constexpr = 0,
     # Trailing defaulted runtime params so pre-existing direct kernel calls
     # (e.g. tests/kernels/test_compressor_kv_cache.py) that predate DCP keep
     # working; only read when DCP_WORLD_SIZE > 1 (dead code under the
@@ -270,6 +299,17 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     tokens = tl.arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
     pos = start + tokens
     mask_pos = pos >= 0
+    if STATE_WINDOW > 0:
+        # P8 ring fold. The writer put the state row for absolute position p
+        # at ring slot p % STATE_WINDOW (block_table.py::
+        # _compute_slot_mapping_kernel applies the identical modulo when it
+        # builds slot_mapping), so the lookback must be folded the same way
+        # before it indexes the block table. `mask_pos` above is computed
+        # from the ABSOLUTE position, so pre-sequence lanes stay masked; the
+        # `tl.where` only keeps the modulo operand non-negative (Triton's
+        # `%` truncates toward zero, so a raw -1 % W would be -1 and would
+        # form a negative row offset even on a masked lane).
+        pos = tl.where(mask_pos, pos, 0) % STATE_WINDOW
 
     block_indices = pos // block_size
     block_numbers = tl.load(
@@ -805,6 +845,9 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     DCP_WORLD_SIZE: tl.constexpr = 1,
     DCP_RANK: tl.constexpr = 0,
     DCP_ENTRY_INTERLEAVE: tl.constexpr = 1,
+    # P8: fp32 compressor-state ring capacity in tokens; 0 == absolute
+    # position addressing (see the shared launcher's docstring).
+    STATE_WINDOW: tl.constexpr = 0,
     # Trailing defaulted runtime params (signature parity with the shared
     # launcher; unused here — indexer writes via kv_slot_mapping).
     kv_block_table_ptr=None,
@@ -855,6 +898,17 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     tokens = tl.arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
     pos = start + tokens
     mask_pos = pos >= 0
+    if STATE_WINDOW > 0:
+        # P8 ring fold. The writer put the state row for absolute position p
+        # at ring slot p % STATE_WINDOW (block_table.py::
+        # _compute_slot_mapping_kernel applies the identical modulo when it
+        # builds slot_mapping), so the lookback must be folded the same way
+        # before it indexes the block table. `mask_pos` above is computed
+        # from the ABSOLUTE position, so pre-sequence lanes stay masked; the
+        # `tl.where` only keeps the modulo operand non-negative (Triton's
+        # `%` truncates toward zero, so a raw -1 % W would be -1 and would
+        # form a negative row offset even on a masked lane).
+        pos = tl.where(mask_pos, pos, 0) % STATE_WINDOW
 
     block_indices = pos // block_size
     block_numbers = tl.load(
@@ -1006,6 +1060,9 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     DCP_WORLD_SIZE: tl.constexpr = 1,
     DCP_RANK: tl.constexpr = 0,
     DCP_ENTRY_INTERLEAVE: tl.constexpr = 1,
+    # P8: fp32 compressor-state ring capacity in tokens; 0 == absolute
+    # position addressing (see the shared launcher's docstring).
+    STATE_WINDOW: tl.constexpr = 0,
     # Trailing defaulted runtime params (signature parity with the shared
     # launcher; unused here).
     kv_block_table_ptr=None,
@@ -1042,6 +1099,17 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     tokens = tl.arange(0, (1 + OVERLAP) * COMPRESS_RATIO)
     pos = start + tokens
     mask_pos = pos >= 0
+    if STATE_WINDOW > 0:
+        # P8 ring fold. The writer put the state row for absolute position p
+        # at ring slot p % STATE_WINDOW (block_table.py::
+        # _compute_slot_mapping_kernel applies the identical modulo when it
+        # builds slot_mapping), so the lookback must be folded the same way
+        # before it indexes the block table. `mask_pos` above is computed
+        # from the ABSOLUTE position, so pre-sequence lanes stay masked; the
+        # `tl.where` only keeps the modulo operand non-negative (Triton's
+        # `%` truncates toward zero, so a raw -1 % W would be -1 and would
+        # form a negative row offset even on a masked lane).
+        pos = tl.where(mask_pos, pos, 0) % STATE_WINDOW
 
     block_indices = pos // block_size
     block_numbers = tl.load(

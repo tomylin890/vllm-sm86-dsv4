@@ -167,6 +167,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
+    get_kv_cache_spec_state_window,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.outputs import (
@@ -704,6 +705,9 @@ class GPUModelRunner(
         # Per-group DCP exemption (VLLM_SM86_DCP); all-False unless the gate
         # is set (see may_reinitialize_input_batch).
         self._init_dcp_exempt = [False]
+        # Per-group P8 compressor-state ring capacity
+        # (VLLM_DSV4_COMPRESSOR_WINDOWED); all-None unless the gate is set.
+        self._init_state_windows: list[int | None] = [None]
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
             # We need to use the encoder length for encoder-decoder
@@ -7271,6 +7275,11 @@ class GPUModelRunner(
         # token-range aligned with the main KV shards. With the gate unset
         # this list is all-False and behavior is unchanged.
         dcp_exempt: list[bool] = []
+        # P8 (VLLM_DSV4_COMPRESSOR_WINDOWED): per-group compressor-state ring
+        # capacity in tokens. Only DeepseekV4 fp32 compressor-state groups
+        # (SlidingWindowMLASpec with state_window set) get a value; every
+        # other group stays None and keeps absolute-position slot mappings.
+        state_windows: list[int | None] = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             kv_cache_spec = kv_cache_group.kv_cache_spec
@@ -7301,6 +7310,17 @@ class GPUModelRunner(
             max_num_blocks_per_req = kv_cache_spec.max_num_blocks_per_req(
                 self.vllm_config, max_model_len
             )
+            # P8: a windowed compressor-state group's block-table row IS the
+            # ring -- exactly cdiv(state_window, block_size) columns. The
+            # helper recurses through the UniformTypeKVCacheSpecs wrapper the
+            # worker-side DSV4 groups arrive in (same reason
+            # get_kv_cache_spec_kind does), which the wrapper's inherited
+            # max_num_blocks_per_req cannot do, so the row width is set here
+            # rather than relying on the spec method.
+            state_window = get_kv_cache_spec_state_window(kv_cache_spec)
+            state_windows.append(state_window)
+            if state_window is not None:
+                max_num_blocks_per_req = cdiv(state_window, block_size)
             max_num_blocks.append(max_num_blocks_per_req)
 
         if (
@@ -7309,12 +7329,14 @@ class GPUModelRunner(
             or max_num_blocks != self._init_max_num_blocks
             or slot_mapping_modes != self._init_slot_mapping_modes
             or dcp_exempt != self._init_dcp_exempt
+            or state_windows != self._init_state_windows
         ):
             self._init_block_sizes = block_sizes
             self._init_kernel_block_sizes = kernel_block_sizes
             self._init_max_num_blocks = max_num_blocks
             self._init_slot_mapping_modes = slot_mapping_modes
             self._init_dcp_exempt = dcp_exempt
+            self._init_state_windows = state_windows
             self.input_batch = InputBatch(
                 max_num_reqs=self.max_num_reqs,
                 max_model_len=max_model_len,
@@ -7333,6 +7355,7 @@ class GPUModelRunner(
                 use_replayssm=self.cache_config.use_replayssm,
                 slot_mapping_modes=slot_mapping_modes,
                 dcp_exempt=dcp_exempt,
+                state_windows=state_windows,
             )
 
         assert self._init_block_sizes == block_sizes, (

@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     TQFullAttentionSpec,
     get_kv_cache_spec_kind,
+    get_kv_cache_spec_state_window,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -901,6 +902,105 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
     def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:
         super().__init__(kv_cache_spec, **kwargs)
         self.sliding_window = kv_cache_spec.sliding_window
+        # P8 (VLLM_DSV4_COMPRESSOR_WINDOWED): DeepseekV4 fp32 compressor-state
+        # groups place row `position` at ring slot `position % state_window`
+        # (block_table.py::_compute_slot_mapping_kernel + the fused compressor
+        # kernels apply the same modulo). The consequences here are:
+        #   * the request owns EXACTLY cdiv(state_window, block_size) blocks,
+        #     allocated once and never grown -- that constant is the whole
+        #     admission reservation, independent of max_num_batched_tokens;
+        #   * nothing is ever "skipped": every ring block stays live for the
+        #     lifetime of the request, so remove_skipped_blocks must not free
+        #     the low columns (they are the ring's wrapped-around rows, not a
+        #     stale prefix).
+        # `ring_blocks` is None for every non-windowed spec, so all of the
+        # branches below are inert on the default path. The window is read
+        # through `get_kv_cache_spec_state_window`, which recurses a
+        # UniformTypeKVCacheSpecs wrapper (same robustness argument as the
+        # kind-based DCP check above), and the ring width is derived from
+        # THIS manager's `self.block_size` so it matches the blocks it hands
+        # out. `self.block_size` is the unsharded spec block size here:
+        # compressor-state groups are dcp_exempt, so the `*= dcp_world_size`
+        # branch above is skipped for them.
+        _state_window = get_kv_cache_spec_state_window(kv_cache_spec)
+        self.ring_blocks: int | None = (
+            None if _state_window is None else cdiv(_state_window, self.block_size)
+        )
+
+    def get_num_blocks_to_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> int:
+        if self.ring_blocks is None:
+            return super().get_num_blocks_to_allocate(
+                request_id,
+                num_tokens,
+                new_computed_blocks,
+                total_computed_tokens,
+                num_local_computed_tokens,
+                num_tokens_main_model,
+                apply_admission_cap,
+            )
+        # Ring: the reservation is the ring itself, regardless of how many
+        # tokens the request has or how many are in flight. Clamping here
+        # (rather than relying on `apply_admission_cap`, which the caller
+        # controls) is what guarantees the block-table row -- exactly
+        # `ring_blocks` columns wide -- can never be overrun.
+        assert not new_computed_blocks, (
+            "P8 windowed compressor state is incompatible with prefix caching"
+        )
+        already = len(self.req_to_blocks.get(request_id, ()))
+        return max(self.ring_blocks - already, 0)
+
+    def allocate_new_blocks(
+        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+    ) -> list[KVCacheBlock]:
+        if self.ring_blocks is None:
+            return super().allocate_new_blocks(
+                request_id, num_tokens, num_tokens_main_model
+            )
+        # Grow the row straight to the FULL ring on first touch and never
+        # again. Two reasons to take the whole ring immediately rather than
+        # cdiv(num_tokens, block_size) blocks:
+        #   * `get_num_blocks_to_allocate` above reserved exactly this many,
+        #     so the allocation can never fail and never under-reserves;
+        #   * the ring wraps at W tokens, so a request that outlives its
+        #     first chunk needs every column anyway, and growing later would
+        #     race the wrap (position W lands in column 0, which must already
+        #     be a real block).
+        return super().allocate_new_blocks(
+            request_id,
+            self.ring_blocks * self.block_size,
+            num_tokens_main_model,
+        )
+
+    def allocate_external_computed_blocks(
+        self,
+        request_id: str,
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        # A ring is not addressable by prefix: rows it did not recompute are
+        # not in it. `get_compressor_state_window` already refuses to start
+        # with prefix caching enabled; a KV connector supplying EXTERNAL
+        # computed tokens is the same hazard through a different door, and
+        # the base implementation would additionally size the row from the
+        # external prefix length and overrun the ring. Fail loudly.
+        if self.ring_blocks is not None and num_external_computed_tokens > 0:
+            raise NotImplementedError(
+                "VLLM_DSV4_COMPRESSOR_WINDOWED: the windowed fp32 compressor "
+                "state cannot consume externally computed KV -- the ring holds "
+                "only rows this worker recomputed."
+            )
+        super().allocate_external_computed_blocks(
+            request_id, num_local_computed_tokens, num_external_computed_tokens
+        )
 
     @classmethod
     def _contiguous_blocks_for_hit(
@@ -1102,6 +1202,12 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         Returns:
             The number of tokens that will be skipped for attention computation.
         """
+        if self.ring_blocks is not None:
+            # P8 windowed compressor state: the block-table row is a ring, so
+            # its low columns hold recent wrapped-around rows, not a stale
+            # prefix. Nothing is ever skippable and freeing anything here
+            # would silently drop live compressor state.
+            return 0
         return max(0, num_computed_tokens - self.sliding_window + 1)
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:

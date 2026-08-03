@@ -58,6 +58,7 @@ class BlockTable:
         cp_kv_cache_interleave_size: int,
         slot_mapping_mode: SlotMappingMode = SlotMappingMode.TOKEN_TO_KV_SLOT,
         shard_dcp: bool = True,
+        state_window: int | None = None,
     ):
         """
         Args:
@@ -78,6 +79,13 @@ class BlockTable:
                 under VLLM_SM86_DCP (e.g. DeepseekV4 sliding-window KV and
                 fp32 compressor-state groups); the default True keeps the
                 original behavior.
+            state_window: P8 (VLLM_DSV4_COMPRESSOR_WINDOWED) ring capacity in
+                tokens for DeepseekV4 fp32 compressor-state groups. When set,
+                slot mappings are computed from `position % state_window`
+                instead of the absolute position, so the block-table row is a
+                fixed cdiv(state_window, block_size)-column ring that never
+                grows with the sequence. None (the default) keeps the
+                original absolute-position addressing for every group.
         """
         self.max_num_reqs = max_num_reqs
         self.max_num_batched_tokens = max_num_batched_tokens
@@ -147,6 +155,20 @@ class BlockTable:
             self.dcp_rank = 0
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
         self.slot_mapping_mode = slot_mapping_mode
+        # P8 windowed compressor state: 0 == off (absolute-position slots).
+        if state_window is not None:
+            if state_window <= 0 or state_window % self.block_size != 0:
+                raise ValueError(
+                    f"state_window {state_window} must be a positive multiple "
+                    f"of the (kernel) block size {self.block_size}"
+                )
+            if state_window // self.block_size > self.max_num_blocks_per_req:
+                raise ValueError(
+                    f"state_window {state_window} needs "
+                    f"{state_window // self.block_size} block-table columns "
+                    f"but the row is only {self.max_num_blocks_per_req} wide"
+                )
+        self.state_window = state_window or 0
 
     def append_row(
         self,
@@ -219,6 +241,7 @@ class BlockTable:
             TOTAL_CP_WORLD_SIZE=self.dcp_world_size,
             TOTAL_CP_RANK=self.dcp_rank,
             CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
+            STATE_WINDOW=self.state_window,
             PAD_ID=PAD_SLOT_ID,
             BLOCK_SIZE=1024,
         )
@@ -295,6 +318,7 @@ class MultiGroupBlockTable:
         cp_kv_cache_interleave_size: int = 1,
         slot_mapping_modes: list[SlotMappingMode] | None = None,
         dcp_exempt: list[bool] | None = None,
+        state_windows: list[int | None] | None = None,
     ) -> None:
         if len(kernel_block_sizes) != len(block_sizes):
             raise ValueError(
@@ -317,6 +341,17 @@ class MultiGroupBlockTable:
         if len(dcp_exempt) != len(block_sizes):
             raise ValueError(
                 f"dcp_exempt length ({len(dcp_exempt)}) "
+                f"must match block_sizes length ({len(block_sizes)})"
+            )
+
+        # Per-group P8 compressor-state ring capacity (tokens); None = the
+        # default absolute-position placement. The all-None default preserves
+        # the original behavior.
+        if state_windows is None:
+            state_windows = [None] * len(block_sizes)
+        if len(state_windows) != len(block_sizes):
+            raise ValueError(
+                f"state_windows length ({len(state_windows)}) "
                 f"must match block_sizes length ({len(block_sizes)})"
             )
 
@@ -349,6 +384,7 @@ class MultiGroupBlockTable:
                 cp_kv_cache_interleave_size,
                 slot_mapping_mode=slot_mapping_mode,
                 shard_dcp=not exempt,
+                state_window=state_window,
             )
             for (
                 block_size,
@@ -356,12 +392,14 @@ class MultiGroupBlockTable:
                 max_num_blocks_per_req,
                 slot_mapping_mode,
                 exempt,
+                state_window,
             ) in zip(
                 block_sizes,
                 kernel_block_sizes,
                 max_num_blocks,
                 slot_mapping_modes,
                 dcp_exempt,
+                state_windows,
             )
         ]
 
@@ -424,6 +462,7 @@ def _compute_slot_mapping_kernel(
     CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
     PAD_ID: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    STATE_WINDOW: tl.constexpr = 0,
 ):
     req_idx = tl.program_id(0)
 
@@ -447,6 +486,15 @@ def _compute_slot_mapping_kernel(
         offsets = i + tl.arange(0, BLOCK_SIZE)
         mask = offsets < end_idx
         pos = tl.load(positions_ptr + offsets, mask=mask, other=0)
+        if STATE_WINDOW > 0:
+            # P8 (VLLM_DSV4_COMPRESSOR_WINDOWED): DeepseekV4 fp32
+            # compressor-state groups address a fixed STATE_WINDOW-token ring
+            # instead of the absolute position, so their block-table row is a
+            # constant cdiv(STATE_WINDOW, block_size) columns wide and the
+            # per-request reservation stops growing with
+            # max_num_batched_tokens. Dead code (compile-time) for every
+            # other group: STATE_WINDOW defaults to 0.
+            pos = pos % STATE_WINDOW
         virtual_block_indices = pos // virtual_block_size
         virtual_block_offsets = pos - virtual_block_indices * virtual_block_size
         is_local = (

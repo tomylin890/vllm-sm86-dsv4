@@ -130,6 +130,8 @@ if TYPE_CHECKING:
     VLLM_DSV4_SM86_INDEXER_TILES: bool = False
     VLLM_DSV4_DELTA_GATHER: bool = False
     VLLM_DSV4_DELTA_GATHER_BUDGET_MB: int = 512
+    VLLM_DSV4_COMPRESSOR_WINDOWED: bool = False
+    VLLM_DSV4_COMPRESSOR_WINDOW: int = 512
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
@@ -1259,6 +1261,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # P7-NOTES.md for the budget table.
     "VLLM_DSV4_DELTA_GATHER_BUDGET_MB": lambda: int(
         os.getenv("VLLM_DSV4_DELTA_GATHER_BUDGET_MB", "512")
+    ),
+    # P8: windowed (ring) placement for the DeepseekV4 fp32 compressor-state
+    # KV groups (SlidingWindowMLASpec). Today those groups are addressed by
+    # ABSOLUTE token position, so a scheduler step of F =
+    # max_num_batched_tokens tokens needs F + sliding_window - 1 live token
+    # rows per request and the per-request block reservation grows linearly
+    # with F (the "F prison": F >= 1024 will not boot on 24 GB cards). With
+    # this flag the state rows are placed at `position % W` in a fixed
+    # W-token ring and the compressor forward is sub-chunked on the flat
+    # token axis at G = W - (1+overlap)*compress_ratio + 1 tokens, which is
+    # exactly the granularity at which the ring provably never clobbers a
+    # row the compression kernel still has to read (P8-NOTES.md section 3).
+    # The per-request reservation becomes the constant cdiv(W, block_size).
+    # Pure data placement: the rows observed by the compression kernel for a
+    # given logical position are bit-identical to the default path.
+    # Requires prefix caching to be OFF. Default off; the default code path
+    # is byte-for-byte unchanged when unset.
+    "VLLM_DSV4_COMPRESSOR_WINDOWED": lambda: (
+        os.getenv("VLLM_DSV4_COMPRESSOR_WINDOWED", "False").lower() in ("true", "1")
+    ),
+    # P8: compressor-state ring capacity in tokens. Must be a positive
+    # multiple of 128 (128 is the largest compressor sliding window and also
+    # the block-table token alignment, so this keeps both compressor-state
+    # block sizes -- 4 and 8 -- and the block-table row width exact) and
+    # strictly greater than 128 so the C128 sub-chunk G stays >= 1.
+    # Memory is linear in W, sub-chunk count is ~ceil(F/(W-128)); pick
+    # W >= F to keep the compressor forward at a single launch pair per
+    # layer, or W < F to trade launches for memory. Only read when
+    # VLLM_DSV4_COMPRESSOR_WINDOWED is set.
+    "VLLM_DSV4_COMPRESSOR_WINDOW": lambda: int(
+        os.getenv("VLLM_DSV4_COMPRESSOR_WINDOW", "512")
     ),
     # Optional: enable external Oink custom ops (e.g., Blackwell RMSNorm).
     # Disabled by default.

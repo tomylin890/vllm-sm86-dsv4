@@ -671,9 +671,64 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     alignment: int | None = None  # Default to None for no padding.
     compress_ratio: int = 1
     model_version: str | None = None
+    # P8 (VLLM_DSV4_COMPRESSOR_WINDOWED): ring capacity in TOKENS for the
+    # DeepseekV4 fp32 compressor-state groups. None = the default
+    # position-space (per absolute token) placement.
+    #
+    # When set, the worker places state row `position` at ring slot
+    # `position % state_window` (block_table.py::_compute_slot_mapping_kernel
+    # and the fused compressor kernels apply the same modulo), so the
+    # per-request block reservation is the CONSTANT cdiv(state_window,
+    # block_size) instead of growing with max_num_batched_tokens. The
+    # compressor forward is sub-chunked so that no live row is ever
+    # clobbered; see P8-NOTES.md for the derivation of the ring bound
+    # W >= G + sliding_window - 1.
+    state_window: int | None = None
 
     def __post_init__(self):
+        if self.state_window is not None:
+            assert self.state_window > 0 and self.state_window % self.block_size == 0, (
+                f"state_window {self.state_window} must be a positive multiple "
+                f"of block_size {self.block_size}"
+            )
+            assert self.state_window > self.sliding_window, (
+                f"state_window {self.state_window} must exceed the compressor "
+                f"lookback sliding_window {self.sliding_window} (otherwise the "
+                f"sub-chunk size G = W - sliding_window + 1 is not positive)"
+            )
         _apply_alignment_padding(self)
+
+    @property
+    def ring_blocks_per_request(self) -> int | None:
+        """Constant per-request block count under P8 windowed placement."""
+        if self.state_window is None:
+            return None
+        return cdiv(self.state_window, self.block_size)
+
+    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
+        # P8: the worker block-table row IS the ring -- exactly
+        # cdiv(state_window, block_size) columns, indexed by
+        # (position % state_window) // block_size, never by position.
+        ring = self.ring_blocks_per_request
+        if ring is not None:
+            return ring
+        return super().max_num_blocks_per_req(vllm_config, max_len)
+
+    def max_admission_blocks_per_request(
+        self, max_in_flight_tokens: int, max_model_len: int
+    ) -> int:
+        # P8: constant -- the ring is allocated once per request and never
+        # grows, so neither max_in_flight_tokens (== concurrent batches x
+        # max_num_batched_tokens) nor max_model_len enters the reservation.
+        # This is the whole point of the phase: it removes the O(F) term
+        # from both the startup pool sizer and the runtime admission gate.
+        ring = self.ring_blocks_per_request
+        if ring is not None:
+            return ring
+        return super().max_admission_blocks_per_request(
+            max_in_flight_tokens=max_in_flight_tokens,
+            max_model_len=max_model_len,
+        )
 
     @property
     def storage_block_size(self) -> int:
@@ -707,16 +762,22 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         model_version_set = set(spec.model_version for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
         block_stride_set = set(spec.indexes_kv_by_block_stride for spec in specs)
+        # P8: all layers of a compressor-state group must share the ring
+        # capacity (it is host config, identical on every rank; a mixed group
+        # would produce inconsistent slot mappings).
+        state_window_set = set(spec.state_window for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
             and len(sliding_window_set) == 1
             and len(block_stride_set) == 1
+            and len(state_window_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "quantization method, compress ratio, model version, sliding "
-            "window size, and KV block stride indexing."
+            "window size, KV block stride indexing, and compressor state "
+            "window."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -729,6 +790,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
+            state_window=state_window_set.pop(),
         )
 
     def is_uniform_with_collection(
@@ -963,6 +1025,28 @@ def get_kv_cache_spec_kind(kv_cache_spec: KVCacheSpec) -> KVCacheSpecKind:
     if isinstance(kv_cache_spec, CrossAttentionSpec):
         return KVCacheSpecKind.CROSS_ATTENTION
     return KVCacheSpecKind.UNKNOWN
+
+
+def get_kv_cache_spec_state_window(kv_cache_spec: KVCacheSpec) -> int | None:
+    """P8: the compressor-state ring capacity (tokens) of a KV cache group.
+
+    Returns None for every group that is not a windowed DeepseekV4
+    compressor-state group (i.e. always, unless
+    VLLM_DSV4_COMPRESSOR_WINDOWED is set). Recurses through
+    UniformTypeKVCacheSpecs because DSV4 worker-side groups arrive wrapped
+    (same reason `get_kv_cache_spec_kind` recurses); a wrapper whose members
+    disagree yields None, which falls back to the default placement rather
+    than silently ringing half a group.
+    """
+    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+        inner = {
+            get_kv_cache_spec_state_window(spec)
+            for spec in kv_cache_spec.kv_cache_specs.values()
+        }
+        return next(iter(inner)) if len(inner) == 1 else None
+    if isinstance(kv_cache_spec, SlidingWindowMLASpec):
+        return kv_cache_spec.state_window
+    return None
 
 
 def get_kv_cache_spec_sliding_window(kv_cache_spec: KVCacheSpec) -> int | None:

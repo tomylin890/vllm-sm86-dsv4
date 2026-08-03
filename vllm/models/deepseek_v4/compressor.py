@@ -154,6 +154,49 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         )
 
 
+def get_compressor_state_window(vllm_config: VllmConfig) -> int | None:
+    """P8: the fp32 compressor-state ring capacity in tokens, or None (off).
+
+    ``VLLM_DSV4_COMPRESSOR_WINDOWED`` replaces the default absolute-position
+    placement of the fp32 compressor state (one paged row per scheduled
+    token, so a step of ``F = max_num_batched_tokens`` tokens forces
+    ``F + sliding_window - 1`` live rows and the per-request reservation
+    grows linearly with F) by a fixed ``W``-token ring: row ``position`` goes
+    to ring slot ``position % W``. Rows are then reused within a step, so the
+    reservation collapses to the constant ``cdiv(W, block_size)``.
+
+    Validation (host config, therefore identical on every TP/PP/DCP rank --
+    scheduler-visible admission stays rank-invariant):
+
+    * ``W % 128 == 0``: 128 is the largest compressor lookback window
+      (C128/indexer) and also ``block_table.get_block_table_width``'s token
+      alignment; a multiple of 128 is divisible by both compressor-state
+      block sizes (4 and 8) and makes the ring an exact whole number of
+      block-table columns for every group.
+    * ``W > 128``: the compressor sub-chunk ``G = W - sliding_window + 1``
+      must be >= 1 for the widest window.
+    * prefix caching must be off: a ring is not prefix-addressable, so a
+      cache hit would hand the request rows that were never recomputed.
+    """
+    if not envs.VLLM_DSV4_COMPRESSOR_WINDOWED:
+        return None
+    window = int(envs.VLLM_DSV4_COMPRESSOR_WINDOW)
+    if window <= 128 or window % 128 != 0:
+        raise ValueError(
+            "VLLM_DSV4_COMPRESSOR_WINDOW must be a multiple of 128 and "
+            f"greater than 128 (the largest compressor lookback); got {window}"
+        )
+    if vllm_config.cache_config.enable_prefix_caching:
+        raise ValueError(
+            "VLLM_DSV4_COMPRESSOR_WINDOWED requires prefix caching to be "
+            "disabled (--no-enable-prefix-caching): the windowed fp32 "
+            "compressor state is a ring keyed by absolute position modulo "
+            "the window, not a prefix-addressable cache, so a prefix-cache "
+            "hit would skip recomputing rows the compression kernel reads."
+        )
+    return window
+
+
 class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
     def __init__(
         self,
@@ -202,6 +245,7 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             dtype=self.dtype,
             sliding_window=self.sliding_window,
             alignment=576 if uses_fp8_ds_mla_layout else 512,
+            state_window=get_compressor_state_window(vllm_config),
         )
 
     def forward(self): ...
@@ -330,6 +374,40 @@ class DeepseekCompressor(nn.Module):
             prefix=f"{prefix}.state_cache",
         )
 
+        # ── P8: windowed (ring) compressor-state placement ────────────────
+        # `state_window` W is the ring capacity in tokens (None == today's
+        # absolute-position placement). `state_chunk` G is the number of FLAT
+        # BATCH TOKENS the compressor forward may write before it must run the
+        # compression pass over them:
+        #
+        #     G = W - L + 1,   L = self.state_cache.sliding_window = coff * m
+        #
+        # L is exactly the reader's span: the fused kernel gathers state rows
+        # [p - (1+OVERLAP)*m + 1, p] for every boundary position p. Within one
+        # sub-chunk every write happens before every read, so the live set
+        # spans at most (G - 1) newly written + (L - 1) looked-back + 1 rows =
+        # G + L - 1 distinct positions; the ring is collision-free iff
+        # W >= G + L - 1. The bound is tight (a sub-chunk that starts exactly
+        # on a boundary position corrupts at G = W - L + 2) -- see
+        # P8-NOTES.md section 3 and the sim.
+        #
+        # Slicing on the FLAT token axis is what makes this per-request safe:
+        # each request's tokens are a contiguous ascending run in the batch,
+        # so a flat slice of G tokens contributes at most G CONSECUTIVE
+        # positions to any single request.
+        #
+        # The two-stage (ROCm split) and cutedsl (SM90+) fused compressors
+        # read the fp32 state with absolute-position addressing and have no
+        # ring variant, so the forward's dispatch puts the windowed branch
+        # AHEAD of both and routes to the Triton kernels -- which is where
+        # SM8x already lands for head_dim 512 and 128 alike. Nothing is
+        # rejected at init; the flag just narrows the kernel choice.
+        self._state_window = get_compressor_state_window(vllm_config)
+        self._state_chunk: int | None = None
+        if self._state_window is not None:
+            self._state_chunk = self._state_window - self.state_cache.sliding_window + 1
+            assert self._state_chunk >= 1
+
         # Save reference to static_forward_context for forward-time KV cache lookup.
         # get_current_vllm_config() is only available during __init__, not forward.
         self._static_forward_context = (
@@ -402,27 +480,66 @@ class DeepseekCompressor(nn.Module):
         # GEMM; state_cache from this kernel) but neither emits/waits on PDL
         # grid dependency primitives, so launch_pdl=True caused a
         # read-after-write race and non-deterministic output.
-        save_partial_states(
-            kv=kv,
-            score=score,
-            ape=self.ape,
-            positions=positions,
-            state_cache=state_cache,
-            slot_mapping=slot_mapping,
-            block_size=block_size,
-            state_width=state_width,
-            compress_ratio=self.compress_ratio,
-            pdl_kwargs=pdl_kwargs,
-        )
-
         # full graph cannot branch on per-step CPU metadata after capture
-        if (
+        skip_compress = (
             current_platform.is_cuda()
             and self.head_dim == 512
             and self.compress_ratio == 128
             and forward_context.cudagraph_runtime_mode != CUDAGraphMode.FULL
             and state_metadata.c128_boundary is False
-        ):
+        )
+
+        # P8 sub-chunk plan on the FLAT token axis. `None` == the default
+        # single full-batch launch pair with the ORIGINAL (unsliced) tensors,
+        # i.e. byte-for-byte the pre-P8 dispatch. Under the flag the plan is a
+        # pure function of `num_actual` (a shape), so a captured CUDA graph
+        # replays a fixed launch sequence.
+        token_ranges: list[tuple[int, int]] | None = None
+        if self._state_chunk is not None:
+            g = self._state_chunk
+            token_ranges = [
+                (a, min(a + g, num_actual)) for a in range(0, num_actual, g)
+            ]
+
+        if token_ranges is None:
+            save_partial_states(
+                kv=kv,
+                score=score,
+                ape=self.ape,
+                positions=positions,
+                state_cache=state_cache,
+                slot_mapping=slot_mapping,
+                block_size=block_size,
+                state_width=state_width,
+                compress_ratio=self.compress_ratio,
+                pdl_kwargs=pdl_kwargs,
+            )
+            if skip_compress:
+                return
+        elif skip_compress:
+            # Windowed, no boundary in this step: still write every row (a
+            # LATER step's boundary reads them back through the ring), just
+            # never compress here. The loop is still required even without a
+            # read: a single launch covering more than W tokens would have two
+            # tokens of one request land on the SAME ring slot concurrently
+            # (positions p and p + W), and the winner would be
+            # nondeterministic. G <= W - L + 1 < W, so within one launch every
+            # request contributes at most G < W consecutive positions and no
+            # two of them collide; across launches the later (higher) position
+            # is written last, which is the correct order.
+            for a, b in token_ranges:
+                save_partial_states(
+                    kv=kv[a:b],
+                    score=score[a:b],
+                    ape=self.ape,
+                    positions=positions[a:b],
+                    state_cache=state_cache,
+                    slot_mapping=slot_mapping[a:b],
+                    block_size=block_size,
+                    state_width=state_width,
+                    compress_ratio=self.compress_ratio,
+                    pdl_kwargs=pdl_kwargs,
+                )
             return
 
         # Fused: compress → RMSNorm → RoPE → FP8 quant → KV cache write.
@@ -450,6 +567,9 @@ class DeepseekCompressor(nn.Module):
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
         # does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
+        windowed_kwargs: dict[str, Any] = (
+            {} if self._state_window is None else {"state_window": self._state_window}
+        )
         if self._dcp_enabled:
             # VLLM_SM86_DCP + dcp>1: the cutedsl and two-stage fused paths
             # have no context-parallel layout support, so route to the
@@ -461,7 +581,15 @@ class DeepseekCompressor(nn.Module):
                 "dcp_world_size": self._dcp_world_size,
                 "dcp_rank": self._dcp_rank,
                 "cp_kv_cache_interleave_size": self._dcp_interleave,
+                **windowed_kwargs,
             }
+        elif self._state_window is not None:
+            # P8: the cutedsl (SM90+) and two-stage (ROCm) fused paths read
+            # the fp32 state with absolute-position addressing and have no
+            # ring variant, so windowing routes to the Triton kernels (which
+            # is where SM8x already lands for both head_dim 512 and 128).
+            compress_norm_rope_store_fn = compress_norm_rope_store_triton
+            extra_kwargs = dict(windowed_kwargs)
         elif is_cutedsl_supported() and self.head_dim == 512:
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 compress_norm_rope_store_cutedsl,
@@ -495,28 +623,81 @@ class DeepseekCompressor(nn.Module):
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
             extra_kwargs = {}
 
-        compress_norm_rope_store_fn(
-            state_cache=state_cache,
-            num_actual=num_actual,
-            token_to_req_indices=token_to_req_indices,
-            positions=positions,
-            slot_mapping=slot_mapping,
-            block_table=block_table,
-            block_size=block_size,
-            state_width=state_width,
-            cos_sin_cache=cos_sin_cache,
-            kv_cache=kv_cache,
-            k_cache_metadata=k_cache_metadata,
-            pdl_kwargs=pdl_kwargs,
-            head_dim=self.head_dim,
-            rope_head_dim=self.rope_head_dim,
-            compress_ratio=self.compress_ratio,
-            overlap=self.overlap,
-            use_fp4_cache=self.use_fp4_cache,
-            rms_norm_weight=self.norm.weight,
-            rms_norm_eps=self.rms_norm_eps,
-            quant_block=self._quant_block,
-            token_stride=self._token_stride,
-            scale_dim=self._scale_dim,
-            **extra_kwargs,
-        )
+        if token_ranges is None:
+            compress_norm_rope_store_fn(
+                state_cache=state_cache,
+                num_actual=num_actual,
+                token_to_req_indices=token_to_req_indices,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                block_table=block_table,
+                block_size=block_size,
+                state_width=state_width,
+                cos_sin_cache=cos_sin_cache,
+                kv_cache=kv_cache,
+                k_cache_metadata=k_cache_metadata,
+                pdl_kwargs=pdl_kwargs,
+                head_dim=self.head_dim,
+                rope_head_dim=self.rope_head_dim,
+                compress_ratio=self.compress_ratio,
+                overlap=self.overlap,
+                use_fp4_cache=self.use_fp4_cache,
+                rms_norm_weight=self.norm.weight,
+                rms_norm_eps=self.rms_norm_eps,
+                quant_block=self._quant_block,
+                token_stride=self._token_stride,
+                scale_dim=self._scale_dim,
+                **extra_kwargs,
+            )
+            return
+
+        # P8 windowed: write G tokens, compress them, repeat. Interleaving the
+        # two launches is what bounds the live row set to G + L - 1 <= W and
+        # therefore decouples the reservation from max_num_batched_tokens.
+        # Request-indexed tensors (block_table, ape, weights) are passed
+        # whole; only the token-indexed ones are sliced, and the compressed-KV
+        # slot mapping is sliced through `kv_slot_mapping` (under DCP the
+        # head=512 kernel derives its slot from the block table and never
+        # reads it).
+        kv_slot_mapping = k_cache_metadata.slot_mapping
+        for a, b in token_ranges:
+            save_partial_states(
+                kv=kv[a:b],
+                score=score[a:b],
+                ape=self.ape,
+                positions=positions[a:b],
+                state_cache=state_cache,
+                slot_mapping=slot_mapping[a:b],
+                block_size=block_size,
+                state_width=state_width,
+                compress_ratio=self.compress_ratio,
+                pdl_kwargs=pdl_kwargs,
+            )
+            compress_norm_rope_store_fn(
+                state_cache=state_cache,
+                num_actual=b - a,
+                token_to_req_indices=token_to_req_indices[a:b],
+                positions=positions[a:b],
+                slot_mapping=slot_mapping[a:b],
+                block_table=block_table,
+                block_size=block_size,
+                state_width=state_width,
+                cos_sin_cache=cos_sin_cache,
+                kv_cache=kv_cache,
+                k_cache_metadata=k_cache_metadata,
+                kv_slot_mapping=(
+                    None if kv_slot_mapping is None else kv_slot_mapping[a:b]
+                ),
+                pdl_kwargs=pdl_kwargs,
+                head_dim=self.head_dim,
+                rope_head_dim=self.rope_head_dim,
+                compress_ratio=self.compress_ratio,
+                overlap=self.overlap,
+                use_fp4_cache=self.use_fp4_cache,
+                rms_norm_weight=self.norm.weight,
+                rms_norm_eps=self.rms_norm_eps,
+                quant_block=self._quant_block,
+                token_stride=self._token_stride,
+                scale_dim=self._scale_dim,
+                **extra_kwargs,
+            )
