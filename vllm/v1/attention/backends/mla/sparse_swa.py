@@ -755,9 +755,23 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 and self.vllm_config.parallel_config.decode_context_parallel_size
                 > 1
             ):
-                result["prefill_req_ids"] = list(
+                prefill_req_ids = list(
                     req_ids[num_decodes : num_decodes + num_prefills]
                 )
+                result["prefill_req_ids"] = prefill_req_ids
+                # Free finished requests' staging across ALL layer trackers
+                # BEFORE any layer executes. The per-layer GC inside the
+                # attention forward runs AFTER that layer's indexer, so on
+                # the first prefill step of a new long request the indexer's
+                # merge transients would otherwise coexist with the previous
+                # request's full staging (~hundreds of MiB at 200k ctx) --
+                # observed as OOM in _sm86_dcp_global_topk on the second
+                # 200k request. Builder runs on every rank with identical
+                # req_ids, so GC stays rank-symmetric; dummy/warmup/capture
+                # runs never reach here (req_ids is None).
+                from vllm.models.deepseek_v4.ampere.dcp_delta_tracker import (
+                    Sm86DcpDeltaTracker)
+                Sm86DcpDeltaTracker.gc_all(prefill_req_ids)
 
         return result
 

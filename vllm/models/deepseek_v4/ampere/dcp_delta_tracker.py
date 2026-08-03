@@ -112,10 +112,23 @@ def _initial_capacity(num_entries: int) -> int:
 class Sm86DcpDeltaTracker:
     """One per compressed attention layer (see module docstring)."""
 
+    # Every live tracker, so the metadata builder can free stale staging
+    # across ALL layers before any layer's forward (and therefore before
+    # any layer's indexer transients) executes. Attention modules live for
+    # the process lifetime, so plain references are fine.
+    _instances: "list[Sm86DcpDeltaTracker]" = []
+
     def __init__(self, device: torch.device) -> None:
         self._device = device
         self._states: dict[str, _ReqDeltaState] = {}
         self._budget = get_delta_gather_budget()
+        Sm86DcpDeltaTracker._instances.append(self)
+
+    @classmethod
+    def gc_all(cls, live_prefill_req_ids: "list[str]") -> None:
+        """Step-level GC over every layer's tracker (rank-symmetric)."""
+        for tracker in cls._instances:
+            tracker.gc(live_prefill_req_ids)
 
     def gc(self, live_prefill_req_ids: "list[str]") -> None:
         """Free every tracked id absent from the current step's prefill rows."""
