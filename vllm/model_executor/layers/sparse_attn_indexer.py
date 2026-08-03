@@ -160,6 +160,39 @@ def _merge_dcp_topk_global(
 _SM86_DCP_INVALID_SCORE = float("-inf")
 
 
+def _sm86_dcp_identity_selection(
+    row_lens: torch.Tensor,
+    topk_tokens: int,
+) -> torch.Tensor:
+    """``[0, 1, ..., n-1, -1, -1, ...]`` per row, int32, width ``topk_tokens``.
+
+    P4 / OPT-3.  When a row's candidate count ``n`` is <= ``topk_tokens``,
+    "top-k of n" is the IDENTITY selection: every candidate is chosen, so the
+    merge that computes *which* ones is pure overhead.  This is the same
+    substitution the rest of the stack already makes -- the compiled selectors'
+    own ``rowLen <= topK`` shortcut emits the valid entries in ascending column
+    order (see ``v1/attention/ops/sm86_det_topk.py``), and DSV4's short-context
+    fast path (``attention.py::_fill_short_context_topk_indices``) and the
+    C128A DCP decode metadata (``[0..count-1, -1]`` rank-local rows) both
+    produce exactly this shape.
+
+    Order note: the selection is the same SET as the merge's, but in ascending
+    index order instead of (score desc, global index asc).  Every consumer
+    treats the row as a set plus a length -- ``combine_topk_swa_indices`` reads
+    ``min((pos+1)//m, topk)`` LEADING slots and
+    ``compute_global_topk_ragged_indices_and_indptr`` counts the ``>= 0``
+    slots -- so prefix-compactness and the valid COUNT are what matter, and
+    both hold here (ARCHITECTURE.md section 10 rule 4: set equivalence).
+
+    Fixed shapes, no collectives, no host sync, capture-safe.
+    """
+    columns = torch.arange(
+        topk_tokens, dtype=torch.int32, device=row_lens.device
+    ).unsqueeze(0)
+    lens = row_lens.to(torch.int32).reshape(-1, 1)
+    return torch.where(columns < lens, columns, torch.full_like(columns, -1))
+
+
 def _sm86_dcp_global_topk(
     local_values: torch.Tensor,
     local_global_indices: torch.Tensor,
@@ -228,6 +261,7 @@ def _sm86_dcp_topk_prefill(
     dcp_world_size: int,
     cp_interleave: int,
     has_local_kv: bool,
+    identity_row_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Merge per-rank prefill local top-k into the global top-k.
 
@@ -240,8 +274,22 @@ def _sm86_dcp_topk_prefill(
     Every rank must call this for every chunk (chunk splits are derived from
     global CPU seq lens, hence rank-invariant) so the all-gather stays
     symmetric even when has_local_kv is False.
+
+    P4 / OPT-3: ``identity_row_lens`` (per row, the GLOBAL compressed-entry
+    count) is passed ONLY when the caller has established host-side that no
+    row can exceed ``topk_tokens`` candidates.  The union of every rank's
+    shard is then the whole causal prefix, i.e. global entries
+    ``0 .. n_global-1``, so both all-gathers and both stable argsorts are
+    skipped for an identity fill in the SAME index space (GLOBAL, request
+    relative -- exactly what ``combine_topk_swa_indices`` consumes).  The gate
+    is a global host int, so every rank skips together and the collectives
+    stay symmetric.
     """
     num_rows = local_topk_indices.shape[0]
+    if identity_row_lens is not None:
+        return _sm86_dcp_identity_selection(
+            identity_row_lens[:num_rows], topk_tokens
+        )
     if has_local_kv:
         gather_indices = torch.clamp(local_topk_indices, min=0).to(torch.int64)
         gather_indices = gather_indices + cu_seqlen_ks.to(torch.int64).unsqueeze(1)
@@ -285,6 +333,7 @@ def _sm86_dcp_topk_decode(
     dcp_rank: int,
     dcp_world_size: int,
     cp_interleave: int,
+    identity_selection: bool = False,
 ) -> torch.Tensor:
     """Merge per-rank decode local top-k into the global top-k, then keep only
     this rank's owned entries as LOCAL indices (the P2 interface contract).
@@ -296,9 +345,21 @@ def _sm86_dcp_topk_decode(
     global index asc) via a stable compaction sort, padded with -1. Only the
     ORDER of the owned prefix differs from the Lasimeri reference (which
     compacted with plain torch.topk); the selected set is identical.
+
+    P4 / OPT-3: with ``identity_selection`` the caller has established
+    host-side that no row's GLOBAL entry count exceeds ``topk_tokens``.  Then
+    the global top-k selects every entry, and after the owned-filter this
+    rank keeps exactly its own shard -- whose LOCAL prefix-compact
+    coordinates are ``0 .. n_local-1`` and whose count is precisely
+    ``seq_lens`` (already the localized count).  So the whole merge collapses
+    to the identity fill, in the rank-LOCAL index space the DCP decode
+    consumer (``ampere_sparse._forward_decode_dcp``) requires -- the same
+    ``[0..count-1, -1]`` rows the C128A branch already hands it.
     """
     num_rows = local_topk_indices.shape[0]
     local_lens = seq_lens.reshape(-1)[:num_rows]
+    if identity_selection:
+        return _sm86_dcp_identity_selection(local_lens, topk_tokens)
     valid = (local_topk_indices >= 0) & (
         local_topk_indices < local_lens.unsqueeze(1)
     )
@@ -651,6 +712,20 @@ def sparse_attn_indexer(
         topk_indices_buffer[: hidden_states.shape[0]] = -1
     # DeepGEMM availability is constant per process; check once for both branches.
     use_deep_gemm = is_deep_gemm_supported()
+    # P4 / OPT-3 (SM8x DSV4 DCP). `max_global_compressed_entries` is
+    # `max_seq_len // compress_ratio` computed by the indexer metadata builder
+    # from the GLOBAL (never DCP-localized) seq lens, so it is a HOST int that
+    # is identical on every DCP rank. When it does not exceed topk_tokens, no
+    # row in this batch can have more global compressed entries than the
+    # selection width, "global top-k of n <= k" is the identity selection, and
+    # the cross-rank merge (2 all-gathers + 2 stable argsorts per chunk per
+    # compressed layer) is provably redundant. Every rank evaluates the same
+    # condition, so the skipped collectives stay symmetric. `-1` means the
+    # builder did not supply the bound: stay on the merge.
+    sm86_dcp_identity_topk = (
+        attn_metadata_narrowed.use_sm86_dcp_topk
+        and 0 <= attn_metadata_narrowed.max_global_compressed_entries <= topk_tokens
+    )
     if not use_deep_gemm:
         assert not use_fp4_cache, (
             "Triton sparse-MLA fallback does not support FP4 KV cache"
@@ -772,6 +847,18 @@ def sparse_attn_indexer(
                 # deterministic global top-k; the CuteDSL merge below is
                 # Hopper+-only. Called for EVERY chunk on every rank (chunk
                 # splits are rank-invariant) so collectives stay symmetric.
+                if sm86_dcp_identity_topk:
+                    # P4 / OPT-3: identity selection (see the gate above).
+                    # The builder attaches the per-row GLOBAL entry counts
+                    # under exactly the same condition that sets
+                    # use_sm86_dcp_topk, so this is never None here.
+                    assert chunk.global_row_entry_lens is not None, (
+                        "VLLM_SM86_DCP prefill identity short-circuit needs "
+                        "the builder's global_row_entry_lens (P4)."
+                    )
+                    identity_row_lens = chunk.global_row_entry_lens
+                else:
+                    identity_row_lens = None
                 topk_indices.copy_(
                     _sm86_dcp_topk_prefill(
                         logits,
@@ -782,6 +869,7 @@ def sparse_attn_indexer(
                         dcp_world_size,
                         cp_kv_cache_interleave_size,
                         has_local_kv=chunk.local_total_seq_lens > 0,
+                        identity_row_lens=identity_row_lens,
                     )
                 )
             else:
@@ -987,6 +1075,11 @@ def sparse_attn_indexer(
                     dcp_rank,
                     dcp_world_size,
                     cp_kv_cache_interleave_size,
+                    # P4 / OPT-3: same host gate as the prefill branch. Here
+                    # the per-row length is already `seq_lens` (this rank's
+                    # LOCAL compressed-entry counts), so nothing extra is
+                    # needed from the builder.
+                    identity_selection=sm86_dcp_identity_topk,
                 )
             )
         elif decode_metadata.global_seq_lens is not None:

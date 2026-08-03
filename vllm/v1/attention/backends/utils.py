@@ -895,6 +895,7 @@ def get_dcp_local_seq_lens(
     Only consider dcp now, we can extend the case of cp based on this.
     """
     seq_lens_i32 = seq_lens.to(torch.int32)
+    rank_offsets: torch.Tensor | int
     if dcp_rank is None:
         rank_offsets = torch.arange(
             dcp_size,
@@ -906,7 +907,13 @@ def get_dcp_local_seq_lens(
         )
         seq_lens_tiled = seq_lens_i32.unsqueeze(-1)
     else:
-        rank_offsets = torch.tensor(dcp_rank, dtype=torch.int32, device=seq_lens.device)
+        # P4: dcp_rank is a per-process constant, so keep it a Python int and
+        # let it fold into the arithmetic below as a scalar operand.  Building
+        # `torch.tensor(dcp_rank, device=seq_lens.device)` here was a blocking
+        # pageable H2D copy on a hot path (this function runs once per
+        # compressed layer per DCP prefill chunk).  int32 tensor minus a
+        # Python int stays int32, so every result below is bit-identical.
+        rank_offsets = dcp_rank
         seq_lens_tiled = seq_lens_i32
     base = (
         seq_lens_tiled

@@ -194,6 +194,14 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     local_cu_seq_lens: torch.Tensor | None = None
     local_total_seq_lens: int = 0
     max_local_total_seq_lens: int = 0
+    # P4 (SM8x DSV4 DCP only; None on every other path): per query row of this
+    # chunk, the GLOBAL compressed-entry count ``(abs_position + 1) // m`` --
+    # i.e. the value the metadata kernel computes as ``len_per_token`` BEFORE
+    # localizing it into ``cu_seqlen_ke``.  Needed by the OPT-3 identity
+    # short-circuit in sparse_attn_indexer; it is NOT recoverable from
+    # ``cu_seqlen_ke - cu_seqlen_ks`` because localization is many-to-one
+    # (W distinct global counts map to the same local count).
+    global_row_entry_lens: torch.Tensor | None = None
 
 
 _BUILD_PREFILL_CHUNK_METADATA_INPUT_VARIANTS = (
@@ -442,6 +450,13 @@ class DeepseekV32IndexerMetadata:
     # the pure-torch deterministic global top-k merge instead of the
     # CuteDSL-only _merge_dcp_topk_global path.
     use_sm86_dcp_topk: bool = False
+    # P4 (OPT-3): batch-wide upper bound on any row's GLOBAL compressed-entry
+    # count, ``max_seq_len // compress_ratio``.  A HOST int derived from the
+    # GLOBAL seq lens, hence identical on every DCP rank -- which is what
+    # makes it safe to use as the collective-skipping gate (all ranks decide
+    # the same way, so the all-gathers stay symmetric).  ``-1`` means "not
+    # provided": the short-circuit then stays off rather than assuming 0.
+    max_global_compressed_entries: int = -1
 
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
@@ -953,6 +968,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     dcp_rank=self.dcp_rank,
                     dcp_world_size=self.dcp_world_size,
                     cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+                    need_global_row_entry_lens=self.use_sm86_dcp,
                 )
                 # Skip when total_seq_lens is 0 (i.e., no compressed token).
                 if metadata is not None:
@@ -1097,6 +1113,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             prefill=prefill_metadata,
             decode=decode_metadata,
             use_sm86_dcp_topk=self.use_sm86_dcp,
+            # P4 / OPT-3 gate. GLOBAL (never localized) and CPU-side, so every
+            # DCP rank computes the same value from the same scheduler output.
+            max_global_compressed_entries=(
+                common_attn_metadata.max_seq_len // self.compress_ratio
+                if self.use_sm86_dcp
+                else -1
+            ),
         )
 
         return attn_metadata
@@ -1117,6 +1140,7 @@ def build_prefill_chunk_metadata(
     dcp_rank: int = 0,
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
+    need_global_row_entry_lens: bool = False,
 ) -> DeepseekV32IndexerPrefillChunkMetadata | None:
     total_seq_lens = compressed_seq_lens_cpu[start_idx:end_idx].sum().item()
     if total_seq_lens == 0:
@@ -1187,6 +1211,35 @@ def build_prefill_chunk_metadata(
         COMPRESS_RATIO=compress_ratio,
     )
 
+    # P4 / OPT-3 (SM8x DSV4 DCP only). Per query row, the GLOBAL
+    # compressed-entry count. The kernel above computes exactly this as
+    # `len_per_token` and then throws it away by localizing it; recompute it
+    # here in fixed-shape, sync-free torch ops rather than widening the
+    # kernel signature (which every non-DCP DSV4/V3.2 deployment shares).
+    #
+    #   kernel:  start_pos  = uncompressed_seq_lens[b] - query_len[b]
+    #            len(abs)   = (start_pos + 1 + (abs - qsl[b])) // m
+    #   here:    row_base[b]= uncompressed_seq_lens[b] - qsl[b + 1]
+    #            len(abs)   = (row_base[b(abs)] + abs + 1) // m
+    # identical since query_len[b] = qsl[b+1] - qsl[b]. `query_start_loc` has
+    # already been rebased to this chunk above, matching the kernel's
+    # `abs_pos = query_start + offset`.
+    global_row_entry_lens = None
+    if need_global_row_entry_lens:
+        query_end_loc = query_start_loc[1:].to(torch.int32).contiguous()
+        abs_query_pos = torch.arange(
+            qs_start, qs_stop, dtype=torch.int32, device=device
+        )
+        # right=True -> the last request whose start is <= abs position, so
+        # zero-length requests (duplicate boundaries) are skipped correctly.
+        row_req = torch.searchsorted(query_end_loc, abs_query_pos, right=True)
+        row_start_pos = (
+            uncompressed_seq_lens[start_idx:end_idx].to(torch.int32) - query_end_loc
+        )
+        global_row_entry_lens = (
+            row_start_pos[row_req] + abs_query_pos + 1
+        ) // compress_ratio
+
     token_start = query_start_loc_cpu[start_idx].item()
     if query_slice is not None:
         token_end = token_start + qs_stop
@@ -1209,4 +1262,5 @@ def build_prefill_chunk_metadata(
         local_cu_seq_lens=local_cu_seq_lens,
         local_total_seq_lens=local_total_seq_lens,
         max_local_total_seq_lens=max_local_total_seq_lens,
+        global_row_entry_lens=global_row_entry_lens,
     )

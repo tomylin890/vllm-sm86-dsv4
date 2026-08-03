@@ -27,6 +27,12 @@ future consumers reuse the same algebra instead of reimplementing it.
 The per-rank owned-entry COUNT lives in
 ``vllm.v1.attention.backends.utils.get_dcp_local_seq_lens`` (same layout;
 apply it to entry counts).
+
+P4 added ``sm86_dcp_owner`` (the ``owner(e)`` formula above, previously only
+reachable one-rank-at-a-time through ``sm86_dcp_owns``) and widened
+``sm86_dcp_global_to_local``'s ``dcp_rank`` to accept a per-element tensor,
+so a caller can build the whole global->(rank, local) map with pure
+elementwise ops.  No formula changed.
 """
 
 import torch
@@ -68,9 +74,33 @@ def sm86_dcp_owns(
     return (global_indices >= 0) & (owner == dcp_rank)
 
 
+def sm86_dcp_owner(
+    global_indices: torch.Tensor,
+    dcp_world_size: int,
+    cp_interleave: int,
+) -> torch.Tensor:
+    """Owning rank of each global compressed-entry index (``owner(e)`` above).
+
+    Forward companion of :func:`sm86_dcp_owns`, which only answers the
+    predicate for one rank at a time: ``sm86_dcp_owns(e, r, W, I)`` is true
+    iff ``sm86_dcp_owner(e, W, I) == r`` (for ``e >= 0``).  Added by P4 so
+    consumers that need the map for ALL entries at once can evaluate it
+    elementwise instead of looping over ranks with boolean-mask indexing
+    (which lowers to ``nonzero()``, i.e. a hard host sync).  ``-1`` passes
+    through unchanged, like every helper here.
+    """
+    safe = torch.clamp(global_indices, min=0)
+    owner = (safe // cp_interleave) % dcp_world_size
+    return torch.where(
+        global_indices >= 0,
+        owner,
+        torch.full_like(owner, -1),
+    )
+
+
 def sm86_dcp_global_to_local(
     global_indices: torch.Tensor,
-    dcp_rank: int,
+    dcp_rank: "int | torch.Tensor",
     dcp_world_size: int,
     cp_interleave: int,
 ) -> torch.Tensor:
@@ -80,6 +110,12 @@ def sm86_dcp_global_to_local(
     callers must mask non-owned entries (the formula returns the local
     PREFIX COUNT for those, matching get_dcp_local_seq_lens semantics).
     -1 passes through unchanged.
+
+    ``dcp_rank`` accepts an int (one rank for the whole tensor, the original
+    and still dominant use) or a broadcastable tensor of per-element owning
+    ranks -- pass ``sm86_dcp_owner(...)`` to get every entry's OWN local
+    index in a single elementwise pass.  The formula is untouched either
+    way; only the operand type widens.
     """
     safe = torch.clamp(global_indices, min=0)
     rank_stride = dcp_world_size * cp_interleave

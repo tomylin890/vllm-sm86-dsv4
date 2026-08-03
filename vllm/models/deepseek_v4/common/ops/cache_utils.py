@@ -14,6 +14,7 @@ preparation.
   window indices for sparse prefill.
 """
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -32,7 +33,8 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import is_cutedsl_supported
 from vllm.utils.math_utils import next_power_of_2
 from vllm.v1.attention.backends.mla.sm86_dcp_layout import (
-    sm86_dcp_local_to_global,
+    sm86_dcp_global_to_local,
+    sm86_dcp_owner,
 )
 from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32, _encode_fp8_u8
 
@@ -414,6 +416,87 @@ _SM86_DCP_ENTRY_SCALE_BYTES = 8  # 7 UE8M0 scales + 1 pad
 _SM86_DCP_ENTRY_BYTES = _SM86_DCP_ENTRY_DATA_BYTES + _SM86_DCP_ENTRY_SCALE_BYTES
 _SM86_DCP_PACK_NUM_WORKERS = 128
 
+# P4 / OPT-2: the virtual block table below is a pure function of five HOST
+# ints (max_entries, max_local, num_reqs, world, interleave) plus the device.
+# It carries no per-layer and no per-request data, yet the DCP prefill gather
+# runs once per COMPRESSED LAYER per chunk (41 layers for Flash) and rebuilt it
+# every time.  Memoize it so a forward pass builds it at most once per distinct
+# shape.  Bounded LRU, because chunked prefill walks max_entries upward and the
+# keys DO churn across a long prefill -- an unbounded dict would leak device
+# memory.  Two independent bounds: an entry count (comfortably covers the few
+# distinct compress-ratio x chunk shapes in one forward, so all 41 compressed
+# layers hit) and a total-element budget, so a long-context batch cannot pin an
+# unbounded amount.  The just-built table is always kept, even if it alone
+# exceeds the budget.
+# 64 MiB ceiling: two decimal orders below the all-gather staging buffers this
+# same function already allocates (num_reqs x max_local x 584 B, times world),
+# and large enough that even a 1M-token C4A prefix (262144 entries) keeps
+# several tables resident instead of thrashing.
+_SM86_DCP_VBT_CACHE_MAXSIZE = 8
+_SM86_DCP_VBT_CACHE_MAX_ELEMS = 16 * 1024 * 1024  # int32 -> 64 MiB
+_SM86_DCP_VBT_CACHE: "OrderedDict[tuple[Any, ...], torch.Tensor]" = OrderedDict()
+
+
+def _sm86_dcp_virtual_block_table(
+    max_entries: int,
+    max_local: int,
+    num_reqs: int,
+    world: int,
+    dcp_interleave: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Virtual ``cache_block_size=1`` block table over the all-gathered buffer.
+
+    Row ``(request c, global entry e)`` must address the flat gathered row of
+    the rank that OWNS ``e``:
+
+        row(c, e) = owner(e) * num_reqs * max_local
+                    + c * max_local
+                    + local_entry(e)
+
+    P4 / OPT-1: this used to be built by looping over ranks and scattering
+    with ``row_base[global_e[in_range]] = ...``.  Boolean-mask advanced
+    indexing lowers to ``nonzero()``, which is a hard ``cudaStreamSynchronize``
+    -- twice per rank iteration (16 syncs at W=8) plus ~120 tiny launches --
+    all to compute a table with no data dependence whatsoever.  It is now the
+    CLOSED-FORM FORWARD map evaluated once over ``e = arange(max_entries)``:
+    fixed shapes, no ``nonzero``, no host sync.  ``sm86_dcp_owner`` and
+    ``sm86_dcp_global_to_local`` are the shared single source of truth
+    (``sm86_dcp_layout.py``) -- the algebra is not restated here.
+
+    RETURNS A SHARED, CACHED TENSOR.  Callers must treat it as READ-ONLY; it
+    is only ever passed as the ``block_table`` input of
+    ``dequantize_and_gather_k_cache_triton``, which reads it and never writes
+    it (the kernel's only stores go to ``out``).
+    """
+    key = (max_entries, max_local, num_reqs, world, dcp_interleave, device)
+    cached = _SM86_DCP_VBT_CACHE.get(key)
+    if cached is not None:
+        _SM86_DCP_VBT_CACHE.move_to_end(key)
+        return cached
+
+    entries = torch.arange(max_entries, dtype=torch.int64, device=device)
+    owner = sm86_dcp_owner(entries, world, dcp_interleave)
+    # Per-element owning rank -> every entry's OWN local index in one pass.
+    local_entry = sm86_dcp_global_to_local(entries, owner, world, dcp_interleave)
+    row_base = owner * (num_reqs * max_local) + local_entry
+    request_offsets = (
+        torch.arange(num_reqs, dtype=torch.int64, device=device) * max_local
+    )
+    virtual_block_table = (
+        row_base.unsqueeze(0) + request_offsets.unsqueeze(1)
+    ).to(torch.int32)
+
+    _SM86_DCP_VBT_CACHE[key] = virtual_block_table
+    total_elems = sum(t.numel() for t in _SM86_DCP_VBT_CACHE.values())
+    while len(_SM86_DCP_VBT_CACHE) > 1 and (
+        len(_SM86_DCP_VBT_CACHE) > _SM86_DCP_VBT_CACHE_MAXSIZE
+        or total_elems > _SM86_DCP_VBT_CACHE_MAX_ELEMS
+    ):
+        _, evicted = _SM86_DCP_VBT_CACHE.popitem(last=False)
+        total_elems -= evicted.numel()
+    return virtual_block_table
+
 
 @triton.jit
 def _sm86_dcp_pack_k_entries_kernel(
@@ -495,9 +578,10 @@ def _sm86_dcp_allgather_dequantize_k_cache(
          so all ranks issue an identical, symmetric collective;
       3. build a virtual ``cache_block_size=1`` block table over the
          gathered buffer that maps GLOBAL entry ``e`` to the owning rank's
-         staging row via the shared inverse formula
-         ``sm86_dcp_local_to_global`` (single source of truth with
-         P2b/P2c -- never reimplemented here);
+         staging row via the shared forward formulas ``sm86_dcp_owner`` /
+         ``sm86_dcp_global_to_local`` (single source of truth with
+         P2b/P2c -- never reimplemented here).  P4 memoizes this table: it
+         depends only on host ints, not on the layer or the KV data;
       4. run the EXISTING dequant kernel against it: the dense bf16 output
          lands in GLOBAL entry order, so the unchanged prefill pipeline
          (combine_topk_swa_indices with P2b's GLOBAL topk indices +
@@ -555,24 +639,14 @@ def _sm86_dcp_allgather_dequantize_k_cache(
         world * num_reqs * max_local, _SM86_DCP_ENTRY_BYTES
     )
 
-    # Virtual block table in GLOBAL entry order. sm86_dcp_local_to_global is
-    # a bijection (rank, local) -> global, and for every global e <
-    # max_entries the owning rank's local index is < max_local, so each of
-    # the max_entries slots is written exactly once (torch.empty is safe).
-    local_j = torch.arange(max_local, dtype=torch.int64, device=device)
-    row_base = torch.empty(max_entries, dtype=torch.int64, device=device)
-    for r in range(world):
-        global_e = sm86_dcp_local_to_global(local_j, r, world, dcp_interleave)
-        in_range = global_e < max_entries
-        row_base[global_e[in_range]] = (
-            r * num_reqs * max_local + local_j[in_range]
-        )
-    request_offsets = (
-        torch.arange(num_reqs, dtype=torch.int64, device=device) * max_local
+    # Virtual block table in GLOBAL entry order. (rank, local) -> global is a
+    # bijection, and for every global e < max_entries the owning rank's local
+    # index is < max_local, so every one of the max_entries slots is defined.
+    # P4: closed-form + memoized; see _sm86_dcp_virtual_block_table. The
+    # returned tensor is SHARED -- read-only below.
+    virtual_block_table = _sm86_dcp_virtual_block_table(
+        max_entries, max_local, num_reqs, world, dcp_interleave, device
     )
-    virtual_block_table = (
-        row_base.unsqueeze(0) + request_offsets.unsqueeze(1)
-    ).to(torch.int32)
 
     # Existing dequant kernel over the gathered buffer viewed as a
     # cache_block_size=1 paged cache (each 584-byte row: 576 data + 8 scales
