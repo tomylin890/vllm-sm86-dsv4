@@ -209,12 +209,18 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
         bytes are dequantized exactly once in the existing kernel (rule 8).
         """
         if torch.cuda.is_current_stream_capturing():
-            # Prefill is never captured in production; guard the per-chunk
-            # allocations + collective against accidental capture (same
-            # eager-first policy as the decode branch).
+            # The ONE narrow eager-only guard left after P2f.  This is not
+            # conservatism: the per-chunk entry bound below is a genuine host
+            # sync (`seq_lens_cpu[...].max().item()`) and it SIZES the DCP
+            # all-gather, so both the launch shape and the collective payload
+            # are data-dependent — neither can be baked into a graph.  Decode
+            # (the path that matters for throughput) is capture-safe; run
+            # cudagraph_mode=FULL_DECODE_ONLY, which never captures prefill.
             raise RuntimeError(
-                "VLLM_SM86_DCP prefill is eager-only (per-chunk staging "
-                "buffers and DCP all-gather cannot be graph-captured)."
+                "VLLM_SM86_DCP compressed-layer prefill is eager-only (the "
+                "per-chunk staging bound is a host sync that sizes the DCP "
+                "all-gather). Use cudagraph_mode=FULL_DECODE_ONLY; DCP decode "
+                "is capture-safe as of P2f."
             )
         assert compressed_k_cache is not None
 
@@ -385,17 +391,39 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
         exactly once at the global max (rule 1); the merge is fp32 with a
         fixed rank order (rule 2, a2a); inverse RoPE runs in ``_o_proj``
         after the merge (rule 10).
+
+        CUDA-graph capture (P2f — lifts P2a's eager-only guard).  Every step
+        below is fixed-shape and sync-free, and everything a captured kernel
+        dereferences lives at an address that survives replay:
+
+        - metadata inputs are persistent builder buffers (``is_valid_token``,
+          ``token_to_req_indices``, ``decode_swa_indices``/``lens``,
+          ``block_table``, ``topk_indices_buffer``,
+          ``c128a_global_decode_topk_indices``) — the discipline the SWA
+          builder already states ("Ensure all metadata tensors maintain fixed
+          memory addresses for CUDA graph compatibility");
+        - both ragged builds write into the persistent ``dcp_decode_*_buffer``
+          scratch the two builders own: the ``_copy_ragged_to_graph_buffers``
+          pattern of the non-DCP path, reached through ``out=`` buffers so the
+          copy disappears;
+        - row WIDTHS are init-time constants (``index_topk`` for C4A, the
+          builder's pinned per-rank bound for C128A — see P2f in sparse_mla.py:
+          the default ``active_topk_width`` tracks ``cm.max_seq_len``, which is
+          ``max_model_len`` at capture but the batch maximum at replay, so a
+          captured consumer would read the dense rows with the wrong stride);
+        - the two collectives (Q all-gather over the DCP group, a2a LSE
+          reduce) are the same calls mainline captures on the standard DCP MLA
+          path (``mla_attention.py``: ``get_dcp_group().all_gather(mqa_q,
+          dim=1)`` then ``dcp_a2a_lse_reduce``), and ``dcp_alltoall``'s
+          send/recv buffers are deliberately ``torch.empty`` so they live in
+          the graph's private pool.
+
+        No host sync (``.item()`` / ``.cpu()``) and no data-dependent control
+        flow exists here; every branch is on a Python constant (compress
+        ratio, world size, and the token counts that are fixed per captured
+        shape).  Compressed-layer PREFILL stays eager-only — see
+        ``_forward_prefill_dcp``.
         """
-        if torch.cuda.is_current_stream_capturing():
-            # Documented eager-only guard: the per-step ragged index build
-            # below allocates fresh tensors (no persistent-address graph
-            # buffers) — eager correctness first per the P2 plan.  Run DCP
-            # with CUDA graphs disabled for attention.
-            raise RuntimeError(
-                "VLLM_SM86_DCP decode is eager-only in P2a; disable CUDA "
-                "graph capture for attention (enforce_eager / cudagraph "
-                "mode NONE)."
-            )
         assert kv_cache is not None
         assert swa_metadata.is_valid_token is not None
         assert swa_metadata.decode_swa_indices is not None
@@ -433,6 +461,24 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
                 "builder's rank-local metadata (P2d W2)."
             )
             local_entry_indices = dense_local.reshape(num_decode_tokens, -1)
+        # P2f: pack straight into the builder's persistent scratch so a FULL
+        # decode graph bakes in addresses that are still ours on replay.  The
+        # widths the buffers were sized for are init-time constants, so this
+        # slice bound only ever shrinks (assert = loud, never silent OOB).
+        topk_ragged_buffer = attn_metadata.dcp_decode_topk_ragged_indices_buffer
+        topk_indptr_buffer = attn_metadata.dcp_decode_topk_ragged_indptr_buffer
+        topk_lens_buffer = attn_metadata.dcp_decode_topk_lens_buffer
+        assert topk_ragged_buffer is not None
+        assert topk_indptr_buffer is not None
+        assert topk_lens_buffer is not None
+        assert (
+            num_decode_tokens * local_entry_indices.shape[-1]
+            <= topk_ragged_buffer.numel()
+        ), (
+            "VLLM_SM86_DCP decode top-k rows exceed the builder's graph "
+            f"buffer: {num_decode_tokens} x {local_entry_indices.shape[-1]} > "
+            f"{topk_ragged_buffer.numel()}"
+        )
         (
             topk_ragged_indices,
             topk_ragged_indptr,
@@ -443,6 +489,9 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
             attn_metadata.block_table[:num_decodes],
             attn_metadata.block_size // self.compress_ratio,
             is_valid,
+            out_ragged=topk_ragged_buffer,
+            out_indptr=topk_indptr_buffer,
+            out_lens=topk_lens_buffer,
         )
 
         # ---- SWA owner selection ----
@@ -462,16 +511,40 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
         ws = dcp_group.world_size
         virtual_block = attn_metadata.block_size * ws
         owner = ((positions % virtual_block) // self._cp_interleave) % ws
-        swa_lens = torch.where(
+        # P2f: masked lens and their ragged expansion land in the SWA
+        # builder's DCP scratch (separate from decode_swa_ragged_*, which the
+        # SWA-only layers still read UNMASKED in the same step).
+        swa_lens_buffer = swa_metadata.dcp_decode_swa_lens_buffer
+        swa_ragged_buffer = swa_metadata.dcp_decode_swa_ragged_indices_buffer
+        swa_indptr_buffer = swa_metadata.dcp_decode_swa_ragged_indptr_buffer
+        assert swa_lens_buffer is not None
+        assert swa_ragged_buffer is not None
+        assert swa_indptr_buffer is not None
+        swa_lens = swa_lens_buffer[:num_decode_tokens]
+        torch.where(
             owner == dcp_group.rank_in_group,
             swa_metadata.decode_swa_lens,
             torch.zeros_like(swa_metadata.decode_swa_lens),
+            out=swa_lens,
         )
         swa_k_cache = self.swa_cache_layer.kv_cache
+        swa_dense_indices = swa_metadata.decode_swa_indices.reshape(
+            num_decode_tokens, -1
+        )
+        assert (
+            num_decode_tokens * swa_dense_indices.shape[-1]
+            <= swa_ragged_buffer.numel()
+        ), (
+            "VLLM_SM86_DCP decode SWA rows exceed the builder's graph buffer: "
+            f"{num_decode_tokens} x {swa_dense_indices.shape[-1]} > "
+            f"{swa_ragged_buffer.numel()}"
+        )
         swa_ragged_indices, swa_ragged_indptr = build_ragged_indices_from_dense(
-            swa_metadata.decode_swa_indices.reshape(num_decode_tokens, -1),
+            swa_dense_indices,
             swa_lens,
             num_rows=swa_k_cache.shape[0] * swa_k_cache.shape[1],
+            out_indices=swa_ragged_buffer,
+            out_indptr=swa_indptr_buffer,
         )
 
         # ---- Attend the local shard with the group's gathered heads ----

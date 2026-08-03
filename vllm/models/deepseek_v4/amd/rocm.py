@@ -251,12 +251,31 @@ def compute_global_topk_ragged_indices_and_indptr(
     block_table: torch.Tensor,
     block_size: int,
     is_valid_token: torch.Tensor,
+    out_ragged: torch.Tensor | None = None,
+    out_indptr: torch.Tensor | None = None,
+    out_lens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Translate dense entry coordinates to flat ragged physical slot ids.
+
+    The ``out_*`` buffers (optional, default ``None`` -> today's fresh
+    allocations, byte-identical behavior) let a caller inside a
+    CUDA-graph-captured region aim every write at persistent, address-stable
+    storage -- the same property ``_copy_ragged_to_graph_buffers`` gives the
+    non-DCP path when it converts at metadata-build time, obtained here
+    without the extra copy.  Only the prefix bounded by ``indptr`` is ever
+    read back, so stale tail bytes from a previous step are inert.
+    """
     topk_indices = topk_indices.reshape(topk_indices.shape[0], -1).contiguous()
     num_tokens = topk_indices.shape[0]
     topk = topk_indices.shape[1]
 
-    topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
+    if out_lens is not None:
+        assert out_lens.numel() >= num_tokens
+        topk_lens = out_lens.reshape(-1)[:num_tokens]
+    else:
+        topk_lens = torch.empty(
+            num_tokens, dtype=torch.int32, device=topk_indices.device
+        )
     _compute_topk_lens_kernel[(num_tokens,)](
         topk_lens,
         topk_indices,
@@ -266,12 +285,24 @@ def compute_global_topk_ragged_indices_and_indptr(
         TRITON_BLOCK_SIZE=1024,
     )
 
-    topk_indptr = _build_indptr_from_lengths(topk_lens)
-    global_topk_ragged = torch.empty(
-        num_tokens * topk,
-        dtype=torch.int32,
-        device=topk_indices.device,
-    )
+    if out_indptr is not None:
+        assert out_indptr.numel() >= num_tokens + 1
+        topk_indptr = out_indptr.reshape(-1)[: num_tokens + 1]
+        # zero_() not `topk_indptr[0] = 0`: a python-scalar store is an H2D
+        # copy from pageable memory, illegal during graph capture.
+        topk_indptr[:1].zero_()
+        torch.cumsum(topk_lens, dim=0, out=topk_indptr[1:])
+    else:
+        topk_indptr = _build_indptr_from_lengths(topk_lens)
+    if out_ragged is not None:
+        assert out_ragged.numel() >= num_tokens * topk
+        global_topk_ragged = out_ragged.reshape(-1)[: num_tokens * topk]
+    else:
+        global_topk_ragged = torch.empty(
+            num_tokens * topk,
+            dtype=torch.int32,
+            device=topk_indices.device,
+        )
     if global_topk_ragged.numel() > 0:
         block = 128
         _pack_global_topk_ragged_kernel[(num_tokens, triton.cdiv(topk, block))](
@@ -320,12 +351,24 @@ class DeepseekV4ROCMAiterMLASparseMetadata(DeepseekV4FlashMLAMetadata):
 
     c128a_decode_topk_ragged_indices: torch.Tensor | None = None
     c128a_decode_topk_ragged_indptr: torch.Tensor | None = None
+    # P2f: persistent, address-stable scratch the SM86 DCP decode consumer
+    # writes its ragged top-k slots into (see the builder for sizing). Only
+    # populated under VLLM_SM86_DCP + dcp>1; None on every default path.
+    dcp_decode_topk_ragged_indices_buffer: torch.Tensor | None = None
+    dcp_decode_topk_ragged_indptr_buffer: torch.Tensor | None = None
+    dcp_decode_topk_lens_buffer: torch.Tensor | None = None
 
 
 @dataclass
 class DeepseekV4ROCMAiterSparseSWAMetadata(DeepseekSparseSWAMetadata):
     decode_swa_ragged_indices: torch.Tensor | None = None
     decode_swa_ragged_indptr: torch.Tensor | None = None
+    # P2f: same idea for the DCP decode branch's owner-masked SWA rebuild,
+    # which cannot reuse decode_swa_ragged_* (those carry the UNMASKED window
+    # every rank would attend). None unless VLLM_SM86_DCP + dcp>1.
+    dcp_decode_swa_ragged_indices_buffer: torch.Tensor | None = None
+    dcp_decode_swa_ragged_indptr_buffer: torch.Tensor | None = None
+    dcp_decode_swa_lens_buffer: torch.Tensor | None = None
 
 
 class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4FlashMLAMetadataBuilder):
@@ -345,8 +388,17 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4FlashMLAMetadataBuil
         )
         self.c128a_decode_topk_ragged_indices_buffer: torch.Tensor | None = None
         self.c128a_decode_topk_ragged_indptr_buffer: torch.Tensor | None = None
-        if self.compress_ratio == 128:
-            max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
+        # P2f: destinations for the SM86 DCP decode ragged pack, which runs in
+        # the ATTENTION forward (i.e. inside the captured region) rather than
+        # here.  Same role as _copy_ragged_to_graph_buffers' targets on the
+        # non-DCP path -- addresses a FULL decode graph can bake in -- reached
+        # without the extra copy by passing them as the pack kernel's out=
+        # buffers.
+        self.dcp_decode_topk_ragged_indices_buffer: torch.Tensor | None = None
+        self.dcp_decode_topk_ragged_indptr_buffer: torch.Tensor | None = None
+        self.dcp_decode_topk_lens_buffer: torch.Tensor | None = None
+        max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
+        if self.compress_ratio == 128 and not self._sm86_dcp:
             self.c128a_decode_topk_ragged_indices_buffer = torch.empty(
                 max_tokens * self.c128a_max_compressed,
                 dtype=torch.int32,
@@ -354,6 +406,34 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4FlashMLAMetadataBuil
             )
             self.c128a_decode_topk_ragged_indptr_buffer = torch.empty(
                 max_tokens + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+        if self._sm86_dcp and self.compress_ratio > 1:
+            # Row width of the dense entry-coordinate rows this group's decode
+            # consumer reads, both fixed at init (no cm.max_seq_len term, so
+            # capture and replay agree):
+            #   C4A   -> the indexer's topk_indices_buffer width (index_topk);
+            #   C128A -> the builder's pinned per-rank owned bound (P2f).
+            # num_decode_tokens <= num_actual_tokens <= max_num_batched_tokens
+            # bounds the row count on every step, captured or eager.
+            dcp_topk_width = (
+                self.topk_tokens
+                if self.compress_ratio != 128
+                else self._sm86_dcp_c128a_width
+            )
+            self.dcp_decode_topk_ragged_indices_buffer = torch.empty(
+                max_tokens * dcp_topk_width,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.dcp_decode_topk_ragged_indptr_buffer = torch.empty(
+                max_tokens + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.dcp_decode_topk_lens_buffer = torch.empty(
+                max_tokens,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -398,6 +478,13 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4FlashMLAMetadataBuil
             **vars(base),
             c128a_decode_topk_ragged_indices=ragged_indices,
             c128a_decode_topk_ragged_indptr=ragged_indptr,
+            dcp_decode_topk_ragged_indices_buffer=(
+                self.dcp_decode_topk_ragged_indices_buffer
+            ),
+            dcp_decode_topk_ragged_indptr_buffer=(
+                self.dcp_decode_topk_ragged_indptr_buffer
+            ),
+            dcp_decode_topk_lens_buffer=self.dcp_decode_topk_lens_buffer,
         )
 
 
@@ -426,6 +513,36 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             dtype=torch.int32,
             device=self.device,
         )
+        # P2f: a second set for the SM86 DCP decode branch.  It rebuilds the
+        # SWA ragged lists per compressed layer from OWNER-MASKED lengths
+        # (exactly one rank per query carries the replicated window, P2a
+        # section 3), so it cannot share the buffers above -- those hold the
+        # unmasked window and are still consumed by the SWA-only layers in the
+        # same step.  Sized identically; the mask only ever shortens rows.
+        # Init-time env snapshot, matching every other P2 gate.
+        self._sm86_dcp = (
+            envs.VLLM_SM86_DCP
+            and self.vllm_config.parallel_config.decode_context_parallel_size > 1
+        )
+        self.dcp_decode_swa_ragged_indices_buffer: torch.Tensor | None = None
+        self.dcp_decode_swa_ragged_indptr_buffer: torch.Tensor | None = None
+        self.dcp_decode_swa_lens_buffer: torch.Tensor | None = None
+        if self._sm86_dcp:
+            self.dcp_decode_swa_ragged_indices_buffer = torch.empty(
+                max_tokens * swa_index_width,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.dcp_decode_swa_ragged_indptr_buffer = torch.empty(
+                max_tokens + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.dcp_decode_swa_lens_buffer = torch.empty(
+                max_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
 
     def build(
         self,
@@ -465,6 +582,13 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             **vars(base),
             decode_swa_ragged_indices=ragged_indices,
             decode_swa_ragged_indptr=ragged_indptr,
+            dcp_decode_swa_ragged_indices_buffer=(
+                self.dcp_decode_swa_ragged_indices_buffer
+            ),
+            dcp_decode_swa_ragged_indptr_buffer=(
+                self.dcp_decode_swa_ragged_indptr_buffer
+            ),
+            dcp_decode_swa_lens_buffer=self.dcp_decode_swa_lens_buffer,
         )
 
 

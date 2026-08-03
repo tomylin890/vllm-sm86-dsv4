@@ -221,6 +221,37 @@ class DeepseekV4FlashMLAMetadataBuilder(
             self.c128a_decode_lens_buffer = torch.empty(
                 max_num_batched_tokens, dtype=torch.int32, device=device
             )
+            # P2f (CUDA-graph capture safety): under VLLM_SM86_DCP + dcp>1 the
+            # DECODE rows are consumed DENSELY inside the attention forward
+            # (ampere_sparse._forward_decode_dcp -> the ragged pack kernel),
+            # i.e. INSIDE the captured region, so their width and row stride
+            # are baked into the graph.  `active_topk_width` is derived from
+            # `cm.max_seq_len`, which is `max_model_len` during capture and the
+            # batch's real maximum at replay -- a captured consumer would then
+            # walk the buffer with the wrong stride and read uninitialised
+            # bytes.  (The non-DCP path is immune: it converts to the
+            # width-independent ragged form at BUILD time and copies into
+            # `_copy_ragged_to_graph_buffers`.)  Pin the gated decode width to
+            # a per-rank constant instead.
+            #
+            # Sizing: rows hold this rank's OWNED entries of `[0..n)` as the
+            # contiguous local prefix `[0..count-1]`, so the width only needs
+            # the per-rank owned bound of the largest possible global entry
+            # count.  With `owner(e) = (e // I) % W` the owned count for a
+            # global count n is `get_dcp_local_seq_lens(n, W, r, I)`, maximised
+            # over ranks at `ceil(ceil(n / I) / W) * I` (monotone in n), so
+            # n = c128a_max_compressed gives the bound below; alignment padding
+            # is inert (-1 rows, capped by decode_lens).
+            if self._sm86_dcp_c128a:
+                interleave = self._cp_interleave
+                owned_bound = (
+                    cdiv(cdiv(c128a_max_compressed, interleave), self._dcp_world_size)
+                    * interleave
+                )
+                self._sm86_dcp_c128a_width = min(
+                    cdiv(owned_bound, _C128A_TOPK_ALIGNMENT) * _C128A_TOPK_ALIGNMENT,
+                    c128a_max_compressed,
+                )
             self.c128a_prefill_buffer = torch.empty(
                 (max_num_batched_tokens, c128a_max_compressed),
                 dtype=torch.int32,
@@ -311,6 +342,7 @@ class DeepseekV4FlashMLAMetadataBuilder(
                     num_decode_tokens,
                     num_total,
                     active_topk_width,
+                    self._sm86_dcp_c128a_width,
                     block_size,
                 )
             )
@@ -347,6 +379,7 @@ class DeepseekV4FlashMLAMetadataBuilder(
         num_decode_tokens: int,
         num_total: int,
         active_topk_width: int,
+        decode_width: int,
         block_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """C128A metadata under VLLM_SM86_DCP + dcp>1 (P2d W2).
@@ -388,6 +421,14 @@ class DeepseekV4FlashMLAMetadataBuilder(
         All writes land in the same persistent buffers as the default path
         (CUDA-graph address stability; the fill is fixed-shape given the
         same token counts and width).
+
+        P2f: the DECODE rows use ``decode_width`` -- the builder's per-rank
+        owned-entry bound, a CONSTANT -- not ``active_topk_width`` (which
+        tracks ``cm.max_seq_len`` and therefore differs between capture and
+        replay).  The gated decode consumer reads these rows densely inside
+        the captured region, so a varying width/stride would make it walk
+        uninitialised buffer bytes on replay.  ``active_topk_width`` still
+        drives the PREFILL rows, which are never captured.
         """
         num_prefill_tokens = num_total - num_decode_tokens
         _, _, prefill_local = build_c128a_topk_metadata(
@@ -405,24 +446,32 @@ class DeepseekV4FlashMLAMetadataBuilder(
         )
         assert prefill_local.shape[0] == num_prefill_tokens
 
-        width = active_topk_width
+        width = decode_width
         global_decode = self.c128a_global_decode_buffer.view(-1)[
             : num_decode_tokens * width
         ].view(num_decode_tokens, width)
         decode_lens = self.c128a_decode_lens_buffer[:num_decode_tokens]
         if num_decode_tokens > 0:
             positions = cm.positions[:num_decode_tokens]
-            # Global entry count, clamped exactly like the kernel's
-            # max_compressed_tokens bound (also bounds padding-row garbage).
+            # Global entry count, clamped by the GLOBAL bound (the row width is
+            # now the per-rank bound, so it cannot cap the global count).  The
+            # clamp still bounds padding-row garbage positions.
             num_entries = torch.clamp(
                 (positions.to(torch.int64) + 1) // self.compress_ratio,
-                max=width,
+                max=self.c128a_max_compressed,
             )
-            local_counts = get_dcp_local_seq_lens(
-                num_entries,
-                self._dcp_world_size,
-                self._dcp_rank,
-                self._cp_interleave,
+            # Owned count <= ceil(ceil(n/I)/W)*I <= width for every
+            # n <= c128a_max_compressed (monotone); the clamp is defensive
+            # only and keeps the row fill in bounds under any future
+            # re-derivation of `width`.
+            local_counts = torch.clamp(
+                get_dcp_local_seq_lens(
+                    num_entries,
+                    self._dcp_world_size,
+                    self._dcp_rank,
+                    self._cp_interleave,
+                ),
+                max=width,
             )
             entry_range = torch.arange(
                 width, dtype=torch.int32, device=positions.device

@@ -1097,31 +1097,66 @@ def build_ragged_indices_from_dense(
     indices: torch.Tensor,
     lengths: torch.Tensor,
     num_rows: int = -1,
+    out_indices: torch.Tensor | None = None,
+    out_indptr: torch.Tensor | None = None,
+    out_lengths: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack a dense ``[rows, width]`` prefix layout into flat ragged form.
+
+    ``out_indices`` / ``out_indptr`` / ``out_lengths`` (all optional, default
+    ``None`` -> today's fresh allocations, byte-identical behavior) let a
+    caller aim every write at persistent, address-stable storage.  This is
+    what makes the builder usable INSIDE a CUDA-graph-captured region: the
+    kernels write the same addresses on every replay instead of whatever the
+    graph's private pool handed out at capture time.  Buffers must be int32,
+    contiguous and at least ``rows * width`` / ``rows + 1`` / ``rows``
+    elements; only the written prefix is ever read back (``indptr`` bounds
+    every downstream read), so stale tail bytes are inert.
+    """
     indices = indices.reshape(indices.shape[0], -1)
     lengths = lengths.to(device=indices.device, dtype=torch.int32).reshape(-1)
     assert lengths.numel() == indices.shape[0], (
         f"Expected one length per row, got {lengths.shape} for indices {indices.shape}"
     )
 
+    num_rows_out = indices.shape[0]
     max_width = indices.shape[1] if indices.ndim == 2 else 0
-    lengths = lengths.clamp(min=0, max=max_width).contiguous()
+    if out_lengths is not None:
+        assert out_lengths.numel() >= num_rows_out
+        clamped = out_lengths.reshape(-1)[:num_rows_out]
+        torch.clamp(lengths, min=0, max=max_width, out=clamped)
+        lengths = clamped
+    else:
+        lengths = lengths.clamp(min=0, max=max_width).contiguous()
 
-    indptr = torch.zeros(indices.shape[0] + 1, dtype=torch.int32, device=indices.device)
+    if out_indptr is not None:
+        assert out_indptr.numel() >= num_rows_out + 1
+        indptr = out_indptr.reshape(-1)[: num_rows_out + 1]
+        # zero_() not `indptr[0] = 0`: a python-scalar store is an H2D copy
+        # from pageable memory, which is illegal during graph capture.
+        indptr[:1].zero_()
+    else:
+        indptr = torch.zeros(
+            num_rows_out + 1, dtype=torch.int32, device=indices.device
+        )
     torch.cumsum(lengths, dim=0, out=indptr[1:])
 
     if indices.numel() == 0:
         flat = torch.empty(0, dtype=torch.int32, device=indices.device)
     else:
-        flat = torch.empty(
-            indices.shape[0] * max_width,
-            dtype=torch.int32,
-            device=indices.device,
-        )
+        if out_indices is not None:
+            assert out_indices.numel() >= num_rows_out * max_width
+            flat = out_indices.reshape(-1)[: num_rows_out * max_width]
+        else:
+            flat = torch.empty(
+                num_rows_out * max_width,
+                dtype=torch.int32,
+                device=indices.device,
+            )
         if flat.numel() > 0:
             block_size = 128
             _pack_dense_prefix_to_ragged_kernel[
-                (indices.shape[0], triton.cdiv(max_width, block_size))
+                (num_rows_out, triton.cdiv(max_width, block_size))
             ](
                 indices,
                 lengths,
