@@ -177,9 +177,9 @@ def ensure_buffers(
         "VLLM_DSV4_FLASH_DECODE buffers must be allocated before CUDA-graph "
         "capture: a buffer created inside one graph's private pool is freed "
         "when that graph dies, and a second graph would replay against a "
-        "dangling address. Keep VLLM_DSV4_WARMUP on (its P9 catalog entry "
-        "runs the decode path at boot), or raise max_num_batched_tokens "
-        "before capture."
+        "dangling address. Keep VLLM_DSV4_WARMUP on: its entry-1 mixed "
+        "prefill+decode dummy runs route decode through this adapter at "
+        "boot, allocating these buffers before any capture."
     )
     return FlashMlaDecodeBuffers(max_tokens, num_heads, head_dim, topk, device)
 

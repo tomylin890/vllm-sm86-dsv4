@@ -112,9 +112,23 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        parallel_config = get_current_vllm_config().parallel_config
+        vllm_config = get_current_vllm_config()
+        parallel_config = vllm_config.parallel_config
         self._dcp_size = parallel_config.decode_context_parallel_size
         self._cp_interleave = parallel_config.cp_kv_cache_interleave_size
+        # P9 review fix: resolve config-derived bounds HERE (the config
+        # context is set during model construction; get_current_vllm_config()
+        # RAISES inside the forward). The flash-decode persistent buffers
+        # only ever hold DECODE rows, whose count is bounded by the largest
+        # decode cudagraph capture size (with a max_num_seqs fallback when
+        # capture is off) -- NOT by max_num_batched_tokens.
+        capture_sizes = (
+            vllm_config.compilation_config.cudagraph_capture_sizes or []
+        )
+        self._flash_decode_max_rows = max(
+            max(capture_sizes, default=0),
+            vllm_config.scheduler_config.max_num_seqs,
+        )
         if (
             envs.VLLM_SM86_DCP
             and self._dcp_size > 1
@@ -1053,10 +1067,9 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
             sparse_decode_partial_via_flash_mla,
         )
 
-        max_tokens = get_current_vllm_config().scheduler_config.max_num_batched_tokens
         self._flash_decode_buffers = ensure_buffers(
             self._flash_decode_buffers,
-            max_tokens=max_tokens,
+            max_tokens=self._flash_decode_max_rows,
             num_heads=q.shape[1],
             head_dim=q.shape[2],
             topk=topk_width,

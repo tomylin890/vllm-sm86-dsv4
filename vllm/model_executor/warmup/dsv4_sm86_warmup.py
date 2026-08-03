@@ -50,10 +50,13 @@ elsewhere):
    ``block_size=1``).
 4. P9: a direct tiny ``flash_mla.sparse_mla_decode_fp8_partial`` call
    (``VLLM_DSV4_FLASH_DECODE`` only): same "fail at boot with the build
-   command" role as entry 2, and -- more importantly -- it is what forces the
-   per-layer persistent decode buffers to be allocated BEFORE CUDA-graph
-   capture. See ``flash_mla_decode.py::ensure_buffers``: a buffer allocated
-   inside one graph's private pool is dangling for the next graph.
+   command" role as entry 2 -- AOT .so load + arch check, nothing more. The
+   per-layer persistent decode buffers are NOT allocated here: they are
+   allocated by entry 1's mixed prefill+decode dummy runs, whose decode rows
+   route through the real ``_forward_decode_dcp`` flash branch (and therefore
+   ``ensure_buffers``) before CUDA-graph capture. This entry stays because it
+   fails FAST (before the expensive dummy runs) on a missing/mismatched
+   build.
 
 NOT in the catalog (already warmed elsewhere, documented here so the
 catalog stays the single map):
