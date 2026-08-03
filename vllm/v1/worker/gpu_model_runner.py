@@ -7323,6 +7323,25 @@ class GPUModelRunner(
                 max_num_blocks_per_req = cdiv(state_window, block_size)
             max_num_blocks.append(max_num_blocks_per_req)
 
+        # P8 cross-check: the compressor READ side folds positions by the
+        # env-derived window (DeepseekCompressor._state_window) while the
+        # WRITE side (slot mapping) uses the spec-derived values collected
+        # above. Any spec-pipeline transform that drops or rewrites
+        # state_window (e.g. spec promotion) would desynchronize the two
+        # silently -- both addresses stay in bounds, so the corruption is
+        # numerically wrong fp32 state with no crash. Fail loudly instead.
+        spec_values = {w for w in state_windows if w is not None}
+        if spec_values:
+            from vllm.models.deepseek_v4.compressor import (
+                get_compressor_state_window)
+            env_window = get_compressor_state_window(self.vllm_config)
+            if spec_values != {env_window}:
+                raise ValueError(
+                    "P8 ring desync: the compressor reader folds positions "
+                    f"by window={env_window} but the KV cache specs carry "
+                    f"state_window values {sorted(spec_values)} -- a spec "
+                    "transform dropped or rewrote the ring geometry.")
+
         if (
             block_sizes != self._init_block_sizes
             or kernel_block_sizes != self._init_kernel_block_sizes

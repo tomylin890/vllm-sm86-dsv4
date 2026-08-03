@@ -194,6 +194,20 @@ def get_compressor_state_window(vllm_config: VllmConfig) -> int | None:
             "the window, not a prefix-addressable cache, so a prefix-cache "
             "hit would skip recomputing rows the compression kernel reads."
         )
+    if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
+        # _promote_local_kv_cache_specs rebuilds SlidingWindowMLASpec as
+        # MLAAttentionSpec and cannot carry state_window, so the write side
+        # (slot mapping, spec-derived) would fall back to absolute placement
+        # while the read side (this module, env-derived) keeps folding
+        # position % W -- silent numerically-wrong fp32 state. Note this
+        # flag is also set IMPLICITLY (KV connector without HMA support,
+        # platforms without support_hybrid_kv_cache()), not only via CLI.
+        raise ValueError(
+            "VLLM_DSV4_COMPRESSOR_WINDOWED requires the hybrid KV cache "
+            "manager (disable_hybrid_kv_cache_manager must be off): spec "
+            "promotion drops the ring geometry and would desynchronize the "
+            "state writer from the compressor reader."
+        )
     return window
 
 
