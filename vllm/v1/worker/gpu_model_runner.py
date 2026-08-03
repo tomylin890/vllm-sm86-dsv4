@@ -2430,6 +2430,14 @@ class GPUModelRunner(
                 self.input_batch.replayssm_decode_base_cpu_tensor[:num_reqs_padded]
             )
 
+        # P7 (SM8x DSV4 DCP delta gather): request identity for the per-layer
+        # persistent staging tracker. Snapshot (copy) because input_batch
+        # mutates across steps while the metadata object may outlive this
+        # build. Gated so the default path allocates nothing.
+        cm_req_ids: list[str] | None = None
+        if envs.VLLM_SM86_DCP and envs.VLLM_DSV4_DELTA_GATHER:
+            cm_req_ids = list(self.input_batch.req_ids)
+
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -2449,6 +2457,7 @@ class GPUModelRunner(
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
+            req_ids=cm_req_ids,
         )
 
         if self.dcp_world_size > 1:

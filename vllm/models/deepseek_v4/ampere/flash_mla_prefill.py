@@ -20,6 +20,11 @@ Index spaces (the crux -- see sim_p6_lens.py for the proof):
   ``row(c, e) = owner(e)*num_reqs*max_local + c*max_local + local(e)`` is
   the memoized virtual block table's row ``c`` -- applied to the id tensor
   directly (``vbt[0][e] + c*max_local``), never rebuilt here.
+- P7 delta layout (``staging_is_global_order=True``): the cache is one
+  request's persistent staging in GLOBAL entry order (row e = entry e), so
+  the extra_indices formula degenerates to the identity -- the producer's
+  GLOBAL ids ARE the flat slot ids. Single-request calls only; nothing
+  else about the op contract changes.
 - SWA stream (``swa_*``): staging row of (request ``c``, position ``p``) is
   ``c*max_gather + (p - gather_start(c))`` -- the same ``pos -
   gather_start`` arithmetic as ``combine_topk_swa_indices``.
@@ -151,6 +156,9 @@ def sparse_prefill_via_flash_mla(
     max_entries: int,
     topk_indices: torch.Tensor | None,  # [T, top_k] int32 GLOBAL ids, -1 pad
     compress_ratio: int,
+    # P7 delta layout: staging is ONE request's [max_entries, 584] buffer in
+    # GLOBAL entry order (extra_indices = ids, identity). vbt must be None.
+    staging_is_global_order: bool = False,
     # Shared.
     query_start_loc: torch.Tensor,  # [R+1] chunk-sliced (device)
     scale: float,
@@ -200,9 +208,8 @@ def sparse_prefill_via_flash_mla(
     extra_indices = None
     extra_lens = None
     if compressed_staging_rows is not None:
-        assert virtual_block_table is not None
         assert topk_indices is not None
-        assert max_entries > 0 and max_local > 0
+        assert max_entries > 0
         world_rows = compressed_staging_rows.shape[0]
         _assert_staging_only(
             "compressed_staging_rows",
@@ -210,21 +217,37 @@ def sparse_prefill_via_flash_mla(
             world_rows,
             forbidden_pools,
         )
-        assert world_rows % (num_reqs * max_local) == 0, (
-            "gathered staging rows must be world * num_reqs * max_local"
-        )
         top_k = topk_indices.shape[-1]
         # TIGHT lens from the producer contract (never by counting -1s):
         # min((pos+1) // m, top_k) valid GLOBAL ids occupy the row prefix.
         extra_len = torch.clamp(
             (pos + 1) // compress_ratio, max=top_k
         )  # int64 [T]
-        # row(c, e) = vbt[0][e] + c * max_local (P4 closed form, memoized --
-        # vbt row c is vbt[0] + c*max_local by construction, so row 0 IS the
-        # request-invariant base map; never rebuilt here).
-        row_base = virtual_block_table[0].to(torch.int64)  # [max_entries]
         safe_ids = topk_indices.to(torch.int64).clamp_(0, max_entries - 1)
-        flat = row_base[safe_ids] + (req * max_local).unsqueeze(1)
+        if staging_is_global_order:
+            # P7 delta layout: staging row e IS global entry e, so the flat
+            # slot id is the producer's GLOBAL id itself (identity). Only
+            # meaningful for a single request's staging.
+            assert virtual_block_table is None
+            assert num_reqs == 1, (
+                "global-order staging is per-request; call the op per request"
+            )
+            assert world_rows == max_entries, (
+                f"global-order staging must be sliced to [max_entries, 584]: "
+                f"{world_rows} != {max_entries}"
+            )
+            flat = safe_ids
+        else:
+            assert virtual_block_table is not None
+            assert max_local > 0
+            assert world_rows % (num_reqs * max_local) == 0, (
+                "gathered staging rows must be world * num_reqs * max_local"
+            )
+            # row(c, e) = vbt[0][e] + c * max_local (P4 closed form, memoized
+            # -- vbt row c is vbt[0] + c*max_local by construction, so row 0
+            # IS the request-invariant base map; never rebuilt here).
+            row_base = virtual_block_table[0].to(torch.int64)  # [max_entries]
+            flat = row_base[safe_ids] + (req * max_local).unsqueeze(1)
         extra_indices = flat.to(torch.int32)
         extra_lens = extra_len.to(torch.int32)
         extra_cache = compressed_staging_rows.view(

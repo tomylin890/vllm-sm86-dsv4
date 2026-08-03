@@ -128,6 +128,8 @@ if TYPE_CHECKING:
     VLLM_DSV4_FLASH_PREFILL: bool = False
     VLLM_DSV4_WARMUP: bool = True
     VLLM_DSV4_SM86_INDEXER_TILES: bool = False
+    VLLM_DSV4_DELTA_GATHER: bool = False
+    VLLM_DSV4_DELTA_GATHER_BUDGET_MB: int = 512
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
@@ -1233,6 +1235,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # reporting compute capability 8.6. Default off.
     "VLLM_DSV4_SM86_INDEXER_TILES": lambda: (
         os.getenv("VLLM_DSV4_SM86_INDEXER_TILES", "False").lower() in ("true", "1")
+    ),
+    # P7: delta (incremental) compressed-entry gather for the SM8x DSV4 DCP
+    # prefill. Instead of re-packing and re-all-gathering the ENTIRE prefix
+    # every chunk (O(P^2/(m*F)) wire volume over a prefill), each request
+    # keeps a persistent per-layer staging buffer in GLOBAL entry order and
+    # only the entries completed since the previous chunk are gathered and
+    # scattered into it (compressed entries are written once at their block
+    # boundary and never mutated, so the staging bytes stay valid). Only
+    # takes effect together with VLLM_SM86_DCP and dcp>1. Default off this
+    # phase (flip after rack validation): all default code paths are
+    # byte-for-byte unchanged when this is unset.
+    "VLLM_DSV4_DELTA_GATHER": lambda: (
+        os.getenv("VLLM_DSV4_DELTA_GATHER", "False").lower() in ("true", "1")
+    ),
+    # P7: byte budget (MiB, per worker process) for the persistent delta-
+    # gather staging buffers, summed across all tracked (request, layer)
+    # pairs. When admitting or growing a request's staging for some layer
+    # would exceed the budget, that (request, layer) is NOT tracked and
+    # falls back to the existing full re-gather path -- graceful, per
+    # request per layer. 512 MiB fits one 131k-token request across all 41
+    # compressed layers of a single-stage (TP8) worker with headroom; see
+    # P7-NOTES.md for the budget table.
+    "VLLM_DSV4_DELTA_GATHER_BUDGET_MB": lambda: int(
+        os.getenv("VLLM_DSV4_DELTA_GATHER_BUDGET_MB", "512")
     ),
     # Optional: enable external Oink custom ops (e.g., Blackwell RMSNorm).
     # Disabled by default.

@@ -467,6 +467,13 @@ class CommonAttentionMetadata:
     decode rows (assumes every draft was accepted). Not safe for kernels
     that need exact per-row context lengths on decode rows."""
 
+    req_ids: list[str] | None = None
+    """Request ids aligned with the (reordered, decodes-first) batch rows.
+    Length is the REAL request count (excludes cudagraph padding rows).
+    Only populated when a backend needs cross-step request identity (today:
+    the SM8x DeepseekV4 DCP delta-gather tracker, VLLM_DSV4_DELTA_GATHER);
+    None everywhere else, including dummy/capture/profile runs."""
+
     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None
     """PrefixLM bidirectional ranges for multimodal tokens. Maps
     request index to list of (start, end) token position ranges

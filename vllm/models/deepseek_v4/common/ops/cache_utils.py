@@ -34,6 +34,7 @@ from vllm.utils.import_utils import is_cutedsl_supported
 from vllm.utils.math_utils import next_power_of_2
 from vllm.v1.attention.backends.mla.sm86_dcp_layout import (
     sm86_dcp_global_to_local,
+    sm86_dcp_local_count,
     sm86_dcp_owner,
 )
 from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32, _encode_fp8_u8
@@ -498,11 +499,11 @@ def _sm86_dcp_virtual_block_table(
     return virtual_block_table
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["local_start", "const_local_len"])
 def _sm86_dcp_pack_k_entries_kernel(
     staging_ptr,  # [num_reqs, max_local_entries, 584] uint8 contiguous
     k_cache_ptr,  # paged cache (uint8 bytes)
-    local_lens_ptr,  # [num_reqs] int32: this rank's owned-entry counts
+    local_lens_ptr,  # [num_reqs] int32 owned-entry counts, or None (P7 delta)
     block_table_ptr,  # [num_reqs, max_blocks_per_seq] int32 (P1-sharded)
     max_blocks_per_seq,
     staging_stride0,
@@ -511,6 +512,8 @@ def _sm86_dcp_pack_k_entries_kernel(
     token_data_size: tl.constexpr,  # 576
     scale_dim: tl.constexpr,  # 8
     block_stride: tl.constexpr,  # cache bytes per page
+    local_start=0,  # P7: first local entry to pack (0 = full prefix)
+    const_local_len=-1,  # P7: entry COUNT as a host scalar when lens ptr is None
 ):
     """Copy this rank's compressed entries out of the paged cache, VERBATIM.
 
@@ -520,13 +523,24 @@ def _sm86_dcp_pack_k_entries_kernel(
     valid ``cache_block_size=1`` paged-cache block, so the existing
     ``_dequantize_and_gather_k_kernel`` can read the gathered buffer without
     any new dequant code (rule 8: bytes + scales move untouched).
+
+    P7 delta form: staging row ``i`` holds local entry ``local_start + i``
+    for ``i in [0, count)`` -- the caller passes ``local_lens_ptr=None`` and
+    the count as ``const_local_len`` (a host int, so the delta launch needs
+    no device lens tensor and no H2D copy). With the defaults
+    (``local_start=0``, lens from the pointer) the addressing is identical
+    to the original kernel: ``j == i``.
     """
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
     num_workers = tl.num_programs(1)
 
-    local_len = tl.load(local_lens_ptr + batch_idx)
-    for j in range(worker_id, local_len, num_workers):
+    if local_lens_ptr is not None:
+        local_len = tl.load(local_lens_ptr + batch_idx)
+    else:
+        local_len = const_local_len
+    for i in range(worker_id, local_len, num_workers):
+        j = local_start + i
         block_in_seq = j // cache_block_size
         pos_in_block = j % cache_block_size
         physical_block_idx = tl.load(
@@ -543,7 +557,7 @@ def _sm86_dcp_pack_k_entries_kernel(
             + cache_block_size * token_data_size
             + pos_in_block * scale_dim
         )
-        out_ptr = staging_ptr + batch_idx * staging_stride0 + j * staging_stride1
+        out_ptr = staging_ptr + batch_idx * staging_stride0 + i * staging_stride1
 
         data_offsets = tl.arange(0, 64)
         for chunk_idx in tl.static_range(token_data_size // 64):
@@ -755,6 +769,166 @@ def sm86_dcp_allgather_k_entries(
         max_entries, max_local, num_reqs, world, dcp_interleave, device
     )
     return gathered_rows, virtual_block_table, max_local
+
+
+# --------------------------------------------------------------------------
+# P7 (VLLM_DSV4_DELTA_GATHER): delta compressed-entry gather. Compressed
+# entries are written ONCE at their block boundary and never mutated, so the
+# per-chunk full re-gather above moves O(P^2/(m*F)) redundant bytes over a
+# chunked prefill. Instead each tracked request keeps a persistent per-layer
+# staging buffer in GLOBAL entry order (row e = global entry e's 584 bytes --
+# row ids stable across chunks, so index translation is the identity for
+# both consumers), and each chunk only gathers the NEW entries
+# [prev_count, new_count) and scatters them into place. Rule 8 throughout:
+# the same pack kernel moves the same verbatim bytes; the only dequant is
+# still the existing kernel (Triton path) or the flash op's in-kernel
+# pre-pass (P6 path).
+# --------------------------------------------------------------------------
+
+# Memoized per-device identity "virtual block table" (an int32 arange) for
+# reading a GLOBAL-entry-order staging with the existing dequant kernel at
+# cache_block_size=1: entry e lives at staging row e, so the table is the
+# identity. Grown geometrically, sliced per call; READ-ONLY for callers
+# (same contract as _sm86_dcp_virtual_block_table -- the dequant kernel
+# never writes its block table).
+_SM86_DCP_IDENTITY_BT: dict[torch.device, torch.Tensor] = {}
+
+
+def sm86_dcp_identity_block_table(
+    num_entries: int, device: torch.device
+) -> torch.Tensor:
+    """``[1, num_entries]`` int32 view of a cached identity arange."""
+    assert num_entries > 0
+    cached = _SM86_DCP_IDENTITY_BT.get(device)
+    if cached is None or cached.numel() < num_entries:
+        capacity = max(next_power_of_2(num_entries), 4096)
+        cached = torch.arange(capacity, dtype=torch.int32, device=device)
+        _SM86_DCP_IDENTITY_BT[device] = cached
+    return cached[:num_entries].view(1, num_entries)
+
+
+def sm86_dcp_delta_gather_k_entries(
+    k_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    dcp_group: "GroupCoordinator",
+    dcp_interleave: int,
+    jobs: "list[tuple[int, int, int, torch.Tensor]]",
+) -> None:
+    """Gather ONLY the delta entries of tracked requests into their staging.
+
+    ``jobs`` is a list of ``(row, prev, new, staging)``:
+      - ``row``: this request's row in ``block_table`` (chunk-relative);
+      - ``prev``/``new``: HOST-int global compressed-entry counts before /
+        after this chunk (from CPU prefill seq lens, which are precise for
+        prefill rows -- see CommonAttentionMetadata.seq_lens_cpu_upper_bound);
+      - ``staging``: the persistent ``[capacity >= new, 584]`` uint8 buffer
+        in GLOBAL entry order; rows ``[prev, new)`` are written, rows
+        ``[0, prev)`` are never touched (append-only, so row ids -- and the
+        bytes behind them -- are stable across chunks).
+
+    Steps (eager only; the callers sit behind the prefill capture guard):
+      1. per job, pack this rank's owned entries of the delta range. The
+         owned subset of global ``[prev, new)`` is the CONTIGUOUS local range
+         ``[local_count(prev), local_count(new))`` (the local enumeration is
+         order-preserving), so the existing pack kernel handles it with just
+         a start offset + host-scalar count (P7 kernel extension);
+      2. one all-gather over the DCP group with equal padded per-rank widths
+         (``max_pad`` = max delta local count over ALL jobs AND ranks --
+         pure host math from rank-invariant CPU lens, so every rank issues
+         an identical, symmetric collective);
+      3. per job, scatter the gathered rows to their GLOBAL positions with a
+         precomputed index_copy_ (fixed shapes -- ``new - prev`` is a host
+         int -- elementwise layout algebra only, no ``nonzero()``, no host
+         sync, no H2D copy).
+
+    The layout algebra is the shared single source of truth
+    (``sm86_dcp_owner`` / ``sm86_dcp_global_to_local`` /
+    ``sm86_dcp_local_count`` in ``sm86_dcp_layout.py``) -- never re-derived
+    here. Bytes and scales move verbatim (rule 8): the staging contents for
+    rows ``[0, new)`` are byte-identical to what the full re-gather above
+    produces for the same global entries (proven in
+    ``scratchpad/sim_p7_delta.py``).
+    """
+    world = dcp_group.world_size
+    rank = dcp_group.rank_in_group
+    device = k_cache.device
+    num_jobs = len(jobs)
+    assert num_jobs > 0
+
+    # Host planning: per-(job, rank) delta local start/count. Rank-invariant
+    # inputs => every rank computes identical shapes.
+    starts = [
+        [
+            sm86_dcp_local_count(prev, r, world, dcp_interleave)
+            for r in range(world)
+        ]
+        for (_, prev, _, _) in jobs
+    ]
+    counts = [
+        [
+            sm86_dcp_local_count(new, r, world, dcp_interleave) - starts[t][r]
+            for r in range(world)
+        ]
+        for t, (_, _, new, _) in enumerate(jobs)
+    ]
+    max_pad = max(cnt for per_rank in counts for cnt in per_rank)
+    if max_pad == 0:
+        # No rank owns any delta entry anywhere (all deltas empty); skipped
+        # BEFORE the collective, symmetric on every rank.
+        return
+
+    send = torch.empty(
+        (num_jobs, max_pad, _SM86_DCP_ENTRY_BYTES),
+        dtype=torch.uint8,
+        device=device,
+    )
+    for t, (row, _prev, _new, _staging) in enumerate(jobs):
+        cnt = counts[t][rank]
+        if cnt == 0:
+            # Nothing owned in this delta on this rank; the padding rows are
+            # never scattered by any receiver (the scatter indices below only
+            # address rows < counts[t][owner]).
+            continue
+        _sm86_dcp_pack_k_entries_kernel[(1, _SM86_DCP_PACK_NUM_WORKERS)](
+            send[t],
+            k_cache,
+            None,  # local_lens_ptr: count comes from the host scalar below
+            block_table[row : row + 1],
+            block_table.shape[-1],
+            0,  # staging_stride0: single-request launch (batch_idx == 0)
+            send.stride(1),
+            cache_block_size=block_size,
+            token_data_size=_SM86_DCP_ENTRY_DATA_BYTES,
+            scale_dim=_SM86_DCP_ENTRY_SCALE_BYTES,
+            block_stride=k_cache.stride(0),
+            local_start=starts[t][rank],
+            const_local_len=cnt,
+        )
+
+    # [world * num_jobs, max_pad, 584], rank-major (fixed NCCL rank order).
+    gathered = dcp_group.all_gather(send, dim=0)
+    gathered_rows = gathered.reshape(
+        world * num_jobs * max_pad, _SM86_DCP_ENTRY_BYTES
+    )
+
+    cycle = world * dcp_interleave
+    for t, (_row, prev, new, staging) in enumerate(jobs):
+        delta = new - prev
+        if delta <= 0:
+            continue
+        assert staging.shape[0] >= new
+        e = torch.arange(prev, new, dtype=torch.int64, device=device)
+        owner = sm86_dcp_owner(e, world, dcp_interleave)
+        local = sm86_dcp_global_to_local(e, owner, world, dcp_interleave)
+        # Per-rank delta local start as a device tensor, computed by the same
+        # closed form as sm86_dcp_local_count from host-int `prev` (no H2D).
+        r = torch.arange(world, dtype=torch.int64, device=device)
+        start_per_rank = (prev // cycle) * dcp_interleave + torch.clamp(
+            (prev % cycle) - r * dcp_interleave, 0, dcp_interleave
+        )
+        src = (owner * num_jobs + t) * max_pad + (local - start_per_rank[owner])
+        staging.index_copy_(0, e, gathered_rows.index_select(0, src))
 
 
 def _sm86_dcp_allgather_dequantize_k_cache(

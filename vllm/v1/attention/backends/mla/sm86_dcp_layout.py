@@ -33,9 +33,37 @@ reachable one-rank-at-a-time through ``sm86_dcp_owns``) and widened
 ``sm86_dcp_global_to_local``'s ``dcp_rank`` to accept a per-element tensor,
 so a caller can build the whole global->(rank, local) map with pure
 elementwise ops.  No formula changed.
+
+P7 added ``sm86_dcp_local_count`` -- the HOST-INT twin of
+``vllm.v1.attention.backends.utils.get_dcp_local_seq_lens`` (the per-rank
+owned-entry COUNT form of the same layout), so the delta-gather planner can
+size symmetric collectives from CPU sequence lengths without touching device
+tensors.  Same formula, int operands.
 """
 
 import torch
+
+
+def sm86_dcp_local_count(
+    num_entries: int,
+    dcp_rank: int,
+    dcp_world_size: int,
+    cp_interleave: int,
+) -> int:
+    """Owned-entry count of ``dcp_rank`` among global entries ``[0, n)``.
+
+    Host-int transcription of ``get_dcp_local_seq_lens`` (utils.py), which is
+    the count form of the ownership algebra above: full interleave cycles of
+    ``W * I`` contribute ``I`` entries per rank; the partial cycle contributes
+    ``clamp(n mod (W*I) - rank*I, 0, I)``.  Also equals
+    ``sm86_dcp_global_to_local(n, rank, ...)`` evaluated at the (possibly
+    non-owned) index ``n`` -- the documented prefix-count semantics of that
+    helper.  Kept here so every consumer of the layout shares one source of
+    truth (P2d W0 discipline)."""
+    base = num_entries // cp_interleave // dcp_world_size * cp_interleave
+    remainder = num_entries - base * dcp_world_size
+    extra = min(max(remainder - dcp_rank * cp_interleave, 0), cp_interleave)
+    return base + extra
 
 
 def sm86_dcp_local_to_global(

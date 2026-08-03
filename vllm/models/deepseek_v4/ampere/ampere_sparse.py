@@ -39,9 +39,15 @@ from vllm.models.deepseek_v4.amd.rocm import (
     combine_topk_swa_indices,
     compute_global_topk_ragged_indices_and_indptr,
 )
+from vllm.models.deepseek_v4.ampere.dcp_delta_tracker import (
+    Sm86DcpDeltaTracker,
+)
 from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
 from vllm.models.deepseek_v4.common.ops.cache_utils import (
+    dequantize_and_gather_k_cache_triton,
     sm86_dcp_allgather_k_entries,
+    sm86_dcp_delta_gather_k_entries,
+    sm86_dcp_identity_block_table,
     sm86_pack_swa_window_entries,
 )
 from vllm.models.deepseek_v4.common.ops.dcp import (
@@ -114,6 +120,11 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
         # for the DCP decode branch (SWA/owner-rank selection needs the
         # absolute query position; `_forward_decode` does not receive it).
         self._dcp_positions: torch.Tensor | None = None
+        # P7 (VLLM_DSV4_DELTA_GATHER): per-LAYER persistent staging tracker
+        # for the delta compressed-entry gather (this module IS one layer,
+        # so layer identity is implicit; under PP each stage only tracks its
+        # own layers). Created lazily on the first delta-eligible prefill.
+        self._delta_gather_tracker: "Sm86DcpDeltaTracker | None" = None
 
     def _dcp_group_or_none(self) -> "GroupCoordinator | None":
         """The DCP group when the SM86 DCP path is active, else None."""
@@ -263,6 +274,13 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
             self.PREFILL_CHUNK_SIZE
         )
 
+        # P7: the per-layer delta tracker, or None -> full re-gather per
+        # chunk (flag off, or no request identities: dummy/warmup runs).
+        # Rank-invariant either way, so the collective plans stay symmetric.
+        delta_tracker = self._maybe_delta_tracker(
+            swa_metadata, compressed_k_cache.device
+        )
+
         if envs.VLLM_DSV4_FLASH_PREFILL:
             # P6: same chunking, same metadata, but the dequant workspace,
             # combine_topk_swa_indices and the Triton prefill kernel are
@@ -280,6 +298,7 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
                 dcp_group=dcp_group,
                 topk_indices=topk_indices,
                 num_chunks=num_chunks,
+                delta_tracker=delta_tracker,
             )
             return
 
@@ -293,26 +312,46 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
             chunk_size = chunk_end - chunk_start
 
             block_table = attn_metadata.block_table[num_decodes:]
-            # DCP delta vs the parent: the compressed cache holds only this
-            # rank's shard; all-gather + reorder to GLOBAL entry order
-            # inside the gather (chunk max entries from CPU seq lens keeps
-            # the collective shape identical on every rank).
-            max_entries = int(
-                seq_lens_cpu[chunk_start:chunk_end].max().item()
-            ) // self.compress_ratio
-            dequantize_and_gather_k_cache(
-                kv[:chunk_size],
-                compressed_k_cache,
-                seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
-                gather_lens=None,
-                block_table=block_table[chunk_start:chunk_end],
-                block_size=attn_metadata.block_size // self.compress_ratio,
-                offset=0,
-                use_fnuz=False,
-                dcp_group=dcp_group,
-                dcp_interleave=self._cp_interleave,
-                dcp_max_entries=max_entries,
-            )
+            if delta_tracker is None:
+                # DCP delta vs the parent: the compressed cache holds only
+                # this rank's shard; all-gather + reorder to GLOBAL entry
+                # order inside the gather (chunk max entries from CPU seq
+                # lens keeps the collective shape identical on every rank).
+                max_entries = int(
+                    seq_lens_cpu[chunk_start:chunk_end].max().item()
+                ) // self.compress_ratio
+                dequantize_and_gather_k_cache(
+                    kv[:chunk_size],
+                    compressed_k_cache,
+                    seq_lens=seq_lens[chunk_start:chunk_end]
+                    // self.compress_ratio,
+                    gather_lens=None,
+                    block_table=block_table[chunk_start:chunk_end],
+                    block_size=attn_metadata.block_size // self.compress_ratio,
+                    offset=0,
+                    use_fnuz=False,
+                    dcp_group=dcp_group,
+                    dcp_interleave=self._cp_interleave,
+                    dcp_max_entries=max_entries,
+                )
+            else:
+                # P7: gather only the NEW entries of tracked requests into
+                # their persistent GLOBAL-order stagings, then dequantize
+                # each request's prefix [0, n) straight out of its staging
+                # (identity block table, block_size=1 -- same kernel, same
+                # per-row 576+scales@576 layout). Untracked requests keep
+                # the full re-gather (one subset collective per chunk).
+                self._delta_fill_compressed_chunk(
+                    kv=kv,
+                    compressed_k_cache=compressed_k_cache,
+                    block_table_chunk=block_table[chunk_start:chunk_end],
+                    attn_metadata=attn_metadata,
+                    swa_metadata=swa_metadata,
+                    dcp_group=dcp_group,
+                    delta_tracker=delta_tracker,
+                    chunk_start=chunk_start,
+                    chunk_end=chunk_end,
+                )
 
             # Replicated (dcp_exempt) SWA cache: unchanged parent code.
             swa_block_table = swa_metadata.block_table[num_decodes:]
@@ -360,6 +399,261 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
                 output=output[query_start:query_end],
             )
 
+    def _maybe_delta_tracker(
+        self,
+        swa_metadata: DeepseekV4ROCMAiterSparseSWAMetadata,
+        device: torch.device,
+    ) -> "Sm86DcpDeltaTracker | None":
+        """The per-layer P7 delta tracker when active, else None; runs GC.
+
+        Active iff VLLM_DSV4_DELTA_GATHER is set AND the builder supplied
+        prefill request identities (it does not on dummy/warmup/capture
+        runs -- those take the full re-gather path, which is always
+        correct). GC frees every tracked id absent from this step's prefill
+        rows: finish/abort/preemption manifest as absence, and a request
+        that reached decode never prefills again, so freeing it early is a
+        strict refinement of the absence rule. GC only runs here (eager
+        prefill steps -- captured decode replays execute no Python), which
+        is safe: staleness is caught structurally by the tracker's
+        prefix-continuity check, and the budget is only ever consulted on
+        prefill steps, after this GC.
+        """
+        if not envs.VLLM_DSV4_DELTA_GATHER:
+            return None
+        prefill_req_ids = swa_metadata.prefill_req_ids
+        if prefill_req_ids is None:
+            return None
+        if self._delta_gather_tracker is None:
+            self._delta_gather_tracker = Sm86DcpDeltaTracker(device)
+        self._delta_gather_tracker.gc(prefill_req_ids)
+        return self._delta_gather_tracker
+
+    def _plan_delta_chunk(
+        self,
+        delta_tracker: "Sm86DcpDeltaTracker",
+        swa_metadata: DeepseekV4ROCMAiterSparseSWAMetadata,
+        chunk_start: int,
+        chunk_end: int,
+    ) -> tuple[
+        "list[tuple[int, int, int, torch.Tensor]]",
+        "dict[int, tuple[int, torch.Tensor]]",
+        "list[int]",
+    ]:
+        """Plan one chunk's delta gather. Pure host math (CPU lens are
+        precise for prefill rows), identical on every DCP rank.
+
+        Returns ``(jobs, tracked, fallback_rows)``:
+          - ``jobs``: ``(chunk_row, prev, new, staging)`` for
+            ``sm86_dcp_delta_gather_k_entries`` (only rows with a non-empty
+            delta);
+          - ``tracked``: ``{chunk_row: (new_entries, staging)}`` -- every
+            row consumed from its persistent staging this chunk;
+          - ``fallback_rows``: chunk-relative rows on the full re-gather
+            path (untracked / budget-blocked / no identity).
+        """
+        seq_lens_cpu = swa_metadata.prefill_seq_lens_cpu
+        query_lens_cpu = swa_metadata.prefill_query_lens_cpu
+        prefill_req_ids = swa_metadata.prefill_req_ids
+        assert seq_lens_cpu is not None
+        assert query_lens_cpu is not None
+        assert prefill_req_ids is not None
+
+        jobs: list[tuple[int, int, int, torch.Tensor]] = []
+        tracked: dict[int, tuple[int, torch.Tensor]] = {}
+        fallback_rows: list[int] = []
+        for i in range(chunk_end - chunk_start):
+            row = chunk_start + i
+            seq_len = int(seq_lens_cpu[row])
+            new_entries = seq_len // self.compress_ratio
+            state = None
+            if row < len(prefill_req_ids):
+                prefix_tokens = seq_len - int(query_lens_cpu[row])
+                state = delta_tracker.plan_request(
+                    prefill_req_ids[row], prefix_tokens, new_entries
+                )
+            if state is None:
+                fallback_rows.append(i)
+                continue
+            assert state.staging is not None
+            if new_entries > state.upto:
+                jobs.append((i, state.upto, new_entries, state.staging))
+            tracked[i] = (new_entries, state.staging)
+            # Advance even on an empty delta so the prefix-continuity chain
+            # stays unbroken across chunks that complete no entry.
+            delta_tracker.advance(state, new_entries, seq_len)
+        return jobs, tracked, fallback_rows
+
+    def _delta_prepare_chunk(
+        self,
+        compressed_k_cache: torch.Tensor,
+        block_table_chunk: torch.Tensor,
+        attn_metadata: DeepseekV4ROCMAiterMLASparseMetadata,
+        swa_metadata: DeepseekV4ROCMAiterSparseSWAMetadata,
+        dcp_group: "GroupCoordinator",
+        delta_tracker: "Sm86DcpDeltaTracker",
+        chunk_start: int,
+        chunk_end: int,
+    ) -> tuple[
+        "dict[int, tuple[int, torch.Tensor]]",
+        "tuple[list[int], torch.Tensor | None, torch.Tensor | None, "
+        "torch.Tensor, int, int] | None",
+    ]:
+        """Move one chunk's compressed bytes: delta for tracked requests,
+        one subset full re-gather for the rest.
+
+        Collective order is fixed (delta first, then the fallback subset)
+        and both plans derive from rank-invariant host state, so every DCP
+        rank issues identical, symmetric collectives.
+
+        Returns ``(tracked, fallback_ctx)`` where ``fallback_ctx`` is None
+        when no row fell back, else ``(fallback_rows, gathered_rows,
+        virtual_block_table, sub_entry_lens, max_local, max_entries_sub)``
+        with ``gathered_rows`` None when the fallback rows have no
+        completed entries (skipped symmetrically, like the non-delta path).
+        """
+        seq_lens = swa_metadata.prefill_seq_lens
+        seq_lens_cpu = swa_metadata.prefill_seq_lens_cpu
+        assert seq_lens is not None and seq_lens_cpu is not None
+        entry_block_size = attn_metadata.block_size // self.compress_ratio
+
+        jobs, tracked, fallback_rows = self._plan_delta_chunk(
+            delta_tracker, swa_metadata, chunk_start, chunk_end
+        )
+        if jobs:
+            sm86_dcp_delta_gather_k_entries(
+                compressed_k_cache,
+                block_table_chunk,
+                entry_block_size,
+                dcp_group,
+                self._cp_interleave,
+                jobs,
+            )
+
+        fallback_ctx = None
+        if fallback_rows:
+            entry_lens_chunk = (
+                seq_lens[chunk_start:chunk_end] // self.compress_ratio
+            )
+            max_entries_sub = max(
+                int(seq_lens_cpu[chunk_start + i]) // self.compress_ratio
+                for i in fallback_rows
+            )
+            if len(fallback_rows) == chunk_end - chunk_start:
+                # Whole chunk fell back: contiguous slices, no index copy.
+                sub_entry_lens = entry_lens_chunk
+                sub_block_table = block_table_chunk
+            else:
+                # Mixed chunk (rare: budget-blocked rows next to tracked
+                # ones). The tiny H2D for the row index list is accepted on
+                # this fallback-only path.
+                sub_index = torch.tensor(
+                    fallback_rows,
+                    dtype=torch.int64,
+                    device=compressed_k_cache.device,
+                )
+                sub_entry_lens = entry_lens_chunk.index_select(0, sub_index)
+                sub_block_table = block_table_chunk.index_select(0, sub_index)
+            if max_entries_sub > 0:
+                gathered_rows, virtual_block_table, max_local = (
+                    sm86_dcp_allgather_k_entries(
+                        compressed_k_cache,
+                        sub_entry_lens,
+                        sub_block_table,
+                        entry_block_size,
+                        dcp_group,
+                        self._cp_interleave,
+                        max_entries_sub,
+                    )
+                )
+            else:
+                gathered_rows, virtual_block_table, max_local = None, None, 0
+            fallback_ctx = (
+                fallback_rows,
+                gathered_rows,
+                virtual_block_table,
+                sub_entry_lens,
+                max_local,
+                max_entries_sub,
+            )
+        return tracked, fallback_ctx
+
+    def _delta_fill_compressed_chunk(
+        self,
+        kv: torch.Tensor,
+        compressed_k_cache: torch.Tensor,
+        block_table_chunk: torch.Tensor,
+        attn_metadata: DeepseekV4ROCMAiterMLASparseMetadata,
+        swa_metadata: DeepseekV4ROCMAiterSparseSWAMetadata,
+        dcp_group: "GroupCoordinator",
+        delta_tracker: "Sm86DcpDeltaTracker",
+        chunk_start: int,
+        chunk_end: int,
+    ) -> None:
+        """P7 Triton-path consumer: fill ``kv[i, 0:n_i)`` per chunk request.
+
+        Tracked requests dequantize straight from their persistent GLOBAL-
+        order staging through the identity block table (block_size=1 -- the
+        per-row 576-data + scales@576 layout the existing kernel already
+        derives, P2d); fallback requests read the subset re-gather through
+        its virtual block table. Same dequant kernel per row either way, so
+        the bf16 workspace contents are byte-identical to the non-delta
+        path (the batch dimension is embarrassingly parallel in the
+        kernel).
+        """
+        device = compressed_k_cache.device
+        seq_lens = swa_metadata.prefill_seq_lens
+        assert seq_lens is not None
+        entry_lens_chunk = seq_lens[chunk_start:chunk_end] // self.compress_ratio
+
+        tracked, fallback_ctx = self._delta_prepare_chunk(
+            compressed_k_cache,
+            block_table_chunk,
+            attn_metadata,
+            swa_metadata,
+            dcp_group,
+            delta_tracker,
+            chunk_start,
+            chunk_end,
+        )
+
+        for i in sorted(tracked):
+            new_entries, staging = tracked[i]
+            if new_entries == 0:
+                continue
+            dequantize_and_gather_k_cache_triton(
+                kv[i : i + 1],
+                staging,
+                seq_lens=entry_lens_chunk[i : i + 1],
+                gather_lens=None,
+                block_table=sm86_dcp_identity_block_table(new_entries, device),
+                block_size=1,
+                offset=0,
+                use_fnuz=False,
+            )
+
+        if fallback_ctx is not None:
+            (
+                fallback_rows,
+                gathered_rows,
+                virtual_block_table,
+                sub_entry_lens,
+                _max_local,
+                _max_entries_sub,
+            ) = fallback_ctx
+            if gathered_rows is not None:
+                assert virtual_block_table is not None
+                for s, i in enumerate(fallback_rows):
+                    dequantize_and_gather_k_cache_triton(
+                        kv[i : i + 1],
+                        gathered_rows,
+                        seq_lens=sub_entry_lens[s : s + 1],
+                        gather_lens=None,
+                        block_table=virtual_block_table[s : s + 1],
+                        block_size=1,
+                        offset=0,
+                        use_fnuz=False,
+                    )
+
     def _forward_prefill_dcp_flash(
         self,
         q: torch.Tensor,
@@ -371,6 +665,7 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
         dcp_group: "GroupCoordinator",
         topk_indices: torch.Tensor,
         num_chunks: int,
+        delta_tracker: "Sm86DcpDeltaTracker | None" = None,
     ) -> None:
         """P6 (VLLM_DSV4_FLASH_PREFILL): fused flash-mla DCP prefill.
 
@@ -420,6 +715,33 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
             # gather_len = query_len + min(prefix, window-1) per the
             # sparse_swa builder, so this bounds every chunk row.
             max_gather = min(max_seq, max_qlen + self.window_size - 1)
+
+            if delta_tracker is not None:
+                # P7: delta gather into persistent GLOBAL-order stagings +
+                # per-request flash op calls (extra_indices become the
+                # identity for tracked requests). Splitting the chunk call
+                # per request changes launch geometry only -- each query
+                # row's softmax is independent of its batch neighbors.
+                self._flash_delta_chunk(
+                    q=q,
+                    compressed_k_cache=compressed_k_cache,
+                    swa_k_cache=swa_k_cache,
+                    output=output,
+                    attn_metadata=attn_metadata,
+                    swa_metadata=swa_metadata,
+                    dcp_group=dcp_group,
+                    delta_tracker=delta_tracker,
+                    topk_indices=topk_indices,
+                    chunk_start=chunk_start,
+                    chunk_end=chunk_end,
+                    max_gather=max_gather,
+                    block_table_chunk=block_table[chunk_start:chunk_end],
+                    swa_block_table_chunk=swa_block_table[
+                        chunk_start:chunk_end
+                    ],
+                    prefill_token_base=int(prefill_token_base),
+                )
+                continue
 
             # Compressed stream: pack + all-gather (skip symmetric at 0).
             gathered_rows = None
@@ -480,6 +802,166 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
                 output=output[query_start:query_end],
                 forbidden_pools=(compressed_k_cache, swa_k_cache),
             )
+
+    def _flash_delta_chunk(
+        self,
+        q: torch.Tensor,
+        compressed_k_cache: torch.Tensor,
+        swa_k_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: DeepseekV4ROCMAiterMLASparseMetadata,
+        swa_metadata: DeepseekV4ROCMAiterSparseSWAMetadata,
+        dcp_group: "GroupCoordinator",
+        delta_tracker: "Sm86DcpDeltaTracker",
+        topk_indices: torch.Tensor,
+        chunk_start: int,
+        chunk_end: int,
+        max_gather: int,
+        block_table_chunk: torch.Tensor,
+        swa_block_table_chunk: torch.Tensor,
+        prefill_token_base: int,
+    ) -> None:
+        """P7 flash-path consumer: one flash-mla op call PER REQUEST.
+
+        Tracked requests hand the op their persistent GLOBAL-order staging
+        sliced to ``[n, 584]`` with ``extra_indices`` = the producer's
+        GLOBAL entry ids as-is (identity translation -- the P6 formula
+        change is exactly and only this, gated on the new layout).
+        Fallback requests read the chunk's subset re-gather through its
+        virtual block table row, i.e. the P6 formula unchanged. The SWA
+        stream is the P6 chunk pack, sliced per request (rows
+        ``[i*max_gather, (i+1)*max_gather)`` are exactly request ``i``'s).
+        Per-request op calls only change launch geometry: each query row's
+        single softmax is independent of its batch neighbors, and the
+        in-op dequant pre-pass now touches exactly one request's staging
+        (less work than the chunk-wide buffer, except for fallback rows,
+        which share -- and each re-dequantize -- the subset buffer).
+        """
+        from vllm.models.deepseek_v4.ampere.flash_mla_prefill import (
+            sparse_prefill_via_flash_mla,
+        )
+
+        seq_lens = swa_metadata.prefill_seq_lens
+        gather_lens = swa_metadata.prefill_gather_lens
+        query_start_loc = swa_metadata.query_start_loc
+        query_start_loc_cpu = swa_metadata.query_start_loc_cpu
+        num_decodes = swa_metadata.num_decodes
+        assert seq_lens is not None and gather_lens is not None
+        assert query_start_loc is not None and query_start_loc_cpu is not None
+
+        tracked, fallback_ctx = self._delta_prepare_chunk(
+            compressed_k_cache,
+            block_table_chunk,
+            attn_metadata,
+            swa_metadata,
+            dcp_group,
+            delta_tracker,
+            chunk_start,
+            chunk_end,
+        )
+
+        # Replicated (dcp_exempt) SWA window: byte-pack, no collective
+        # (unchanged P6 kernel, chunk-level).
+        swa_staging_rows = sm86_pack_swa_window_entries(
+            swa_k_cache,
+            seq_lens[chunk_start:chunk_end],
+            gather_lens[chunk_start:chunk_end],
+            swa_block_table_chunk,
+            swa_metadata.block_size,
+            max_gather,
+        )
+
+        fallback_pos: dict[int, int] = {}
+        fb_gathered = None
+        fb_vbt = None
+        fb_max_local = 0
+        fb_max_entries = 0
+        if fallback_ctx is not None:
+            (
+                fallback_rows,
+                fb_gathered,
+                fb_vbt,
+                _fb_lens,
+                fb_max_local,
+                fb_max_entries,
+            ) = fallback_ctx
+            fallback_pos = {row: s for s, row in enumerate(fallback_rows)}
+
+        for i in range(chunk_end - chunk_start):
+            row = chunk_start + i
+            query_start = (
+                int(query_start_loc_cpu[num_decodes + row]) - prefill_token_base
+            )
+            query_end = (
+                int(query_start_loc_cpu[num_decodes + row + 1])
+                - prefill_token_base
+            )
+            if query_end <= query_start:
+                continue
+            swa_rows_i = swa_staging_rows[i * max_gather : (i + 1) * max_gather]
+            if i in tracked:
+                new_entries, staging = tracked[i]
+                has_compressed = new_entries > 0
+                sparse_prefill_via_flash_mla(
+                    q[query_start:query_end],
+                    swa_staging_rows=swa_rows_i,
+                    max_gather=max_gather,
+                    seq_lens=seq_lens[row : row + 1],
+                    gather_lens=gather_lens[row : row + 1],
+                    window_size=self.window_size,
+                    compressed_staging_rows=(
+                        staging[:new_entries] if has_compressed else None
+                    ),
+                    virtual_block_table=None,
+                    max_local=0,
+                    max_entries=new_entries,
+                    topk_indices=(
+                        topk_indices[query_start:query_end]
+                        if has_compressed
+                        else None
+                    ),
+                    compress_ratio=self.compress_ratio,
+                    staging_is_global_order=True,
+                    query_start_loc=query_start_loc[
+                        num_decodes + row : num_decodes + row + 2
+                    ],
+                    scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    output=output[query_start:query_end],
+                    forbidden_pools=(compressed_k_cache, swa_k_cache),
+                )
+            else:
+                s = fallback_pos[i]
+                has_compressed = fb_gathered is not None
+                sparse_prefill_via_flash_mla(
+                    q[query_start:query_end],
+                    swa_staging_rows=swa_rows_i,
+                    max_gather=max_gather,
+                    seq_lens=seq_lens[row : row + 1],
+                    gather_lens=gather_lens[row : row + 1],
+                    window_size=self.window_size,
+                    compressed_staging_rows=(
+                        fb_gathered if has_compressed else None
+                    ),
+                    virtual_block_table=(
+                        fb_vbt[s : s + 1] if has_compressed else None
+                    ),
+                    max_local=fb_max_local,
+                    max_entries=fb_max_entries,
+                    topk_indices=(
+                        topk_indices[query_start:query_end]
+                        if has_compressed
+                        else None
+                    ),
+                    compress_ratio=self.compress_ratio,
+                    query_start_loc=query_start_loc[
+                        num_decodes + row : num_decodes + row + 2
+                    ],
+                    scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    output=output[query_start:query_end],
+                    forbidden_pools=(compressed_k_cache, swa_k_cache),
+                )
 
     def _forward_decode(
         self,

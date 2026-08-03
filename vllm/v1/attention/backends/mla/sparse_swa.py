@@ -5,6 +5,7 @@ from typing import ClassVar, cast
 
 import torch
 
+from vllm import envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.warmup.jit_warmup import (
@@ -197,6 +198,13 @@ class DeepseekSparseSWAMetadata:
     prefill_window_size: int = 0
     prefill_max_model_len: int = 0
     prefill_max_num_batched_tokens: int = 0
+    # P7 (VLLM_DSV4_DELTA_GATHER): request ids aligned with the prefill rows
+    # (index i <-> prefill_seq_lens[i]), for the per-layer persistent delta-
+    # gather staging tracker in ampere_sparse.py. None unless VLLM_SM86_DCP +
+    # VLLM_DSV4_DELTA_GATHER + dcp>1 and the runner supplied identities (it
+    # does not on dummy/capture/profile runs -- consumers then take the full
+    # re-gather path, which is always correct).
+    prefill_req_ids: "list[str] | None" = None
 
     # Per-layer-type FlashMLA tile-scheduler metadata. One FlashMLASchedMeta
     # per present DeepseekV4 layer type, shared across all ~60 layers of that type
@@ -615,6 +623,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             seq_lens_cpu,
             query_start_loc,
             query_start_loc_cpu,
+            common_attn_metadata.req_ids,
         )
 
         # Per-layer-type tile-scheduler plan holders. Empty FlashMLASchedMeta
@@ -696,6 +705,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         seq_lens_cpu: torch.Tensor | None,
         query_start_loc: torch.Tensor,
         query_start_loc_cpu: torch.Tensor,
+        req_ids: "list[str] | None" = None,
     ) -> dict[str, torch.Tensor | int | None]:
         """Pre-compute DeepseekV4 prefill metadata during the metadata build phase.
 
@@ -732,6 +742,22 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             result["prefill_window_size"] = self.window_size
             result["prefill_max_model_len"] = self.max_model_len
             result["prefill_max_num_batched_tokens"] = self.max_num_batched_tokens
+
+            # P7 (VLLM_DSV4_DELTA_GATHER): prefill-row request identities for
+            # the per-layer delta-gather staging tracker. req_ids has the REAL
+            # request count (no padding rows); prefill rows past its end (only
+            # possible on padded batches, whose padded rows carry seq_len 0)
+            # simply have no identity and take the full re-gather path.
+            if (
+                req_ids is not None
+                and envs.VLLM_SM86_DCP
+                and envs.VLLM_DSV4_DELTA_GATHER
+                and self.vllm_config.parallel_config.decode_context_parallel_size
+                > 1
+            ):
+                result["prefill_req_ids"] = list(
+                    req_ids[num_decodes : num_decodes + num_prefills]
+                )
 
         return result
 
