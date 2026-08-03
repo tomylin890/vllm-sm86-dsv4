@@ -126,6 +126,8 @@ if TYPE_CHECKING:
     VLLM_SM86_DCP: bool = False
     VLLM_SM86_DET_TOPK: bool = False
     VLLM_DSV4_FLASH_PREFILL: bool = False
+    VLLM_DSV4_FLASH_DECODE: bool = False
+    VLLM_DSV4_FLASH_DECODE_SCRATCH_MB: int = 1024
     VLLM_DSV4_WARMUP: bool = True
     VLLM_DSV4_SM86_INDEXER_TILES: bool = False
     VLLM_DSV4_DELTA_GATHER: bool = False
@@ -1213,6 +1215,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all default code paths are byte-for-byte unchanged when this is unset.
     "VLLM_DSV4_FLASH_PREFILL": lambda: (
         os.getenv("VLLM_DSV4_FLASH_PREFILL", "False").lower() in ("true", "1")
+    ),
+    # P9: route the SM8x DSV4 DCP compressed-layer DECODE attention through
+    # the PATCHED flash-mla fork's partial CUDA op
+    # (fwd_sparse_decode_mla_partial) instead of the Triton ragged decode
+    # kernel. The op returns this rank's normalized PRE-SINK output plus a
+    # natural-log fp32 LSE, which the existing dcp.py merge consumes directly
+    # (the sink is still folded exactly once, at the global max, in the
+    # merge). Requires the fork branch `dcp-sm86-patches` built with
+    # FLASH_MLA_CUDA_ARCHS=86, and only takes effect together with
+    # VLLM_SM86_DCP and dcp>1 (at dcp==1 the layer keeps the parent Triton
+    # decode -- there is no cross-rank partial to produce). Default off: all
+    # default code paths are byte-for-byte unchanged when this is unset.
+    "VLLM_DSV4_FLASH_DECODE": lambda: (
+        os.getenv("VLLM_DSV4_FLASH_DECODE", "False").lower() in ("true", "1")
+    ),
+    # P9: ceiling for the flash-mla decode op's internal selection scratch,
+    # T * (swa_window + topk) * 1 KiB. Bounded loudly instead of OOMing inside
+    # the op: the SWA stream is passed at its FULL window width because the
+    # tight per-token length is only known on device.
+    "VLLM_DSV4_FLASH_DECODE_SCRATCH_MB": lambda: int(
+        os.getenv("VLLM_DSV4_FLASH_DECODE_SCRATCH_MB", "1024")
     ),
     # P6: DSV4 SM8x JIT warmup catalog. Runs the resolved sparse-MLA
     # prefill/decode kernel family (mixed dummy batches at the min and max

@@ -26,11 +26,14 @@ DCP group).  With the gate unset or dcp == 1 every path below falls through
 to the unchanged parent implementation.
 """
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from vllm import envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import GroupCoordinator, get_dcp_group
+from vllm.logger import init_logger
 from vllm.models.deepseek_v4.amd.rocm import (
     DeepseekV4ROCMAiterMLAAttention,
     DeepseekV4ROCMAiterMLASparseBackend,
@@ -62,6 +65,13 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_sparse_attn_prefill,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
+
+if TYPE_CHECKING:
+    from vllm.models.deepseek_v4.ampere.flash_mla_decode import (
+        FlashMlaDecodeBuffers,
+    )
+
+logger = init_logger(__name__)
 
 
 class DeepseekV4AmpereMLASparseBackend(DeepseekV4ROCMAiterMLASparseBackend):
@@ -125,6 +135,23 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
         # so layer identity is implicit; under PP each stage only tracks its
         # own layers). Created lazily on the first delta-eligible prefill.
         self._delta_gather_tracker: "Sm86DcpDeltaTracker | None" = None
+        # P9 (VLLM_DSV4_FLASH_DECODE): per-LAYER persistent destinations for
+        # the flash-mla partial decode op. Allocated on the first decode call
+        # (which the warmup catalog forces to happen before graph capture) so
+        # a captured launch and its captured consumer share a stable address.
+        self._flash_decode_buffers: "FlashMlaDecodeBuffers | None" = None
+        if envs.VLLM_DSV4_FLASH_DECODE and not (
+            envs.VLLM_SM86_DCP and self._dcp_size > 1
+        ):
+            # Honest no-op rather than a silent one: the op produces a
+            # cross-rank PARTIAL, which only means something under DCP.
+            logger.warning_once(
+                "VLLM_DSV4_FLASH_DECODE is set but the SM86 DCP decode path "
+                "is inactive (VLLM_SM86_DCP=%s, dcp=%d); the Triton decode "
+                "runs unchanged.",
+                envs.VLLM_SM86_DCP,
+                self._dcp_size,
+            )
 
     def _dcp_group_or_none(self) -> "GroupCoordinator | None":
         """The DCP group when the SM86 DCP path is active, else None."""
@@ -998,6 +1025,57 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
             output=output,
         )
 
+    def _flash_decode_partial(
+        self,
+        *,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        swa_k_cache: torch.Tensor,
+        swa_indices: torch.Tensor,
+        swa_lens: torch.Tensor,
+        topk_ragged_indices: torch.Tensor,
+        topk_ragged_indptr: torch.Tensor,
+        topk_lens: torch.Tensor,
+        topk_width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """P9 (VLLM_DSV4_FLASH_DECODE): the flash-mla partial decode call.
+
+        Returns ``(out, lse)`` in exactly the form
+        ``dcp_merge_flashmla_output`` consumes -- normalized PRE-sink output
+        and a natural-log fp32 LSE -- written into PERSISTENT buffers so a
+        FULL decode graph captures stable addresses (P2f discipline).  The
+        buffers are created on the first call, which the P9 warmup catalog
+        entry forces to happen before capture; ``ensure_buffers`` asserts that
+        no allocation is attempted during capture.
+        """
+        from vllm.models.deepseek_v4.ampere.flash_mla_decode import (
+            ensure_buffers,
+            sparse_decode_partial_via_flash_mla,
+        )
+
+        max_tokens = get_current_vllm_config().scheduler_config.max_num_batched_tokens
+        self._flash_decode_buffers = ensure_buffers(
+            self._flash_decode_buffers,
+            max_tokens=max_tokens,
+            num_heads=q.shape[1],
+            head_dim=q.shape[2],
+            topk=topk_width,
+            device=q.device,
+        )
+        return sparse_decode_partial_via_flash_mla(
+            q,
+            swa_k_cache=swa_k_cache,
+            swa_indices=swa_indices,
+            swa_lens=swa_lens,
+            compressed_k_cache=kv_cache,
+            topk_ragged_indices=topk_ragged_indices,
+            topk_ragged_indptr=topk_ragged_indptr,
+            topk_lens=topk_lens,
+            topk_width=topk_width,
+            scale=self.scale,
+            buffers=self._flash_decode_buffers,
+        )
+
     def _forward_decode_dcp(
         self,
         q: torch.Tensor,
@@ -1109,7 +1187,7 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
         (
             topk_ragged_indices,
             topk_ragged_indptr,
-            _topk_lens,
+            topk_lens,
         ) = compute_global_topk_ragged_indices_and_indptr(
             local_entry_indices,
             swa_metadata.token_to_req_indices,
@@ -1166,6 +1244,37 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
             f"{num_decode_tokens} x {swa_dense_indices.shape[-1]} > "
             f"{swa_ragged_buffer.numel()}"
         )
+
+        # ---- Attend the local shard with the group's gathered heads ----
+        if envs.VLLM_DSV4_FLASH_DECODE:
+            # P9: same partial contract, produced by the flash-mla CUDA op.
+            # It takes the DENSE swa rows (and a dense translation of the
+            # compressed ragged rows), so the SWA ragged rebuild above is not
+            # needed and is skipped -- one fewer Triton launch per layer per
+            # decode step.  The op emits the fused natural-log LSE directly, so
+            # `softmax_stats_to_lse` is skipped too (see flash_mla_decode.py).
+            q, num_real_heads, dcp_group, use_dcp = _maybe_gather_dcp_q(self, q)
+            assert use_dcp
+            out_attn, lse = self._flash_decode_partial(
+                q=q,
+                kv_cache=kv_cache,
+                swa_k_cache=swa_k_cache,
+                swa_indices=swa_dense_indices,
+                swa_lens=swa_lens,
+                topk_ragged_indices=topk_ragged_indices,
+                topk_ragged_indptr=topk_ragged_indptr,
+                topk_lens=topk_lens[:num_decode_tokens],
+                topk_width=local_entry_indices.shape[-1],
+            )
+            dcp_merge_flashmla_output(
+                out_attn[:, :num_real_heads, :],
+                lse[:, :num_real_heads],
+                self.attn_sink,
+                output,
+                dcp_group,
+            )
+            return
+
         swa_ragged_indices, swa_ragged_indptr = build_ragged_indices_from_dense(
             swa_dense_indices,
             swa_lens,
@@ -1174,7 +1283,6 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
             out_indptr=swa_indptr_buffer,
         )
 
-        # ---- Attend the local shard with the group's gathered heads ----
         q, num_real_heads, dcp_group, use_dcp = _maybe_gather_dcp_q(self, q)
         assert use_dcp
         partials = rocm_sparse_attn_decode(

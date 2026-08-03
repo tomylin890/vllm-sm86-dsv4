@@ -242,7 +242,22 @@ def quantize_and_insert_k_cache(
     )
 
 
-@triton.jit
+# P9: `max_blocks_per_seq` is the block-table ROW STRIDE and nothing else
+# (`block_table_ptr + batch_idx * max_blocks_per_seq`, below) -- pure integer
+# address arithmetic, so moving it out of the constexpr set cannot change a
+# single computed value.  As a constexpr it was the SM8x prefill JIT tax: the
+# DCP all-gather path passes `_sm86_dcp_virtual_block_table`'s width, which is
+# `max_entries` and therefore GROWS with the chunk index, and the P7 delta path
+# passes `sm86_dcp_identity_block_table(new_entries)`, which varies per request
+# per chunk -- so every new context-length bucket paid a fresh ~7-8 s Triton
+# compile of this kernel (the leaf under all six py-spy caller frames:
+# ampere_sparse.py {148,177,344,623}, cache_utils.py 377, amd/rocm.py 748).
+# `do_not_specialize` also suppresses Triton's implicit divisible-by-16 /
+# equals-1 specialization on the value, collapsing the family to ONE compile
+# per (cache_block_size, block_stride, use_fnuz) -- all of which take two
+# values at most.  The sibling kernels in this file already pass their block
+# table stride as a plain runtime arg (see `_combine_topk_swa_indices_kernel`).
+@triton.jit(do_not_specialize=["max_blocks_per_seq"])
 def _dequantize_and_gather_k_kernel(
     out_ptr,
     out_stride0,
@@ -252,8 +267,8 @@ def _dequantize_and_gather_k_kernel(
     block_table_ptr,
     offset,
     gather_lens_ptr,
+    max_blocks_per_seq,  # block-table row stride (runtime; see note above)
     # Constants
-    max_blocks_per_seq: tl.constexpr,
     fp8_dim: tl.constexpr,  # 448
     bf16_dim: tl.constexpr,  # 64
     scale_dim: tl.constexpr,  # 8

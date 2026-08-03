@@ -33,6 +33,27 @@ elsewhere):
    surfaces a missing or arch-mismatched build AT BOOT with the build
    command in the error, and covers the ``extra_cache`` stream even when
    the dummy batch is too short to complete a compressed entry.
+3. P9: a geometric CHUNK-COUNT ladder over
+   ``dequantize_and_gather_k_cache_triton``. That kernel is the leaf under
+   every py-spy caller frame of the measured per-bucket JIT tax
+   (``ampere_sparse.py`` {148,177,344,623}, ``cache_utils.py`` 377,
+   ``amd/rocm.py`` 748): a long prefill walks ``max_entries`` upward chunk by
+   chunk, and ``max_entries`` was the kernel's ``max_blocks_per_seq``
+   constexpr, so each new context-length bucket compiled a fresh
+   specialization inside the first request that reached it. P9 pins that
+   argument (``do_not_specialize``, ``cache_utils.py``) because it is only an
+   address stride; the ladder stays as the CANARY -- with the pin it costs one
+   compile and a handful of microsecond launches, and if the pin is ever
+   reverted it moves the whole bucket family back to boot instead of into
+   requests. It runs both ``cache_block_size`` shapes that survive as genuine
+   constexprs (the paged pool's block size and the DCP/delta stagings'
+   ``block_size=1``).
+4. P9: a direct tiny ``flash_mla.sparse_mla_decode_fp8_partial`` call
+   (``VLLM_DSV4_FLASH_DECODE`` only): same "fail at boot with the build
+   command" role as entry 2, and -- more importantly -- it is what forces the
+   per-layer persistent decode buffers to be allocated BEFORE CUDA-graph
+   capture. See ``flash_mla_decode.py::ensure_buffers``: a buffer allocated
+   inside one graph's private pool is dangling for the next graph.
 
 NOT in the catalog (already warmed elsewhere, documented here so the
 catalog stays the single map):
@@ -103,6 +124,101 @@ def _warmup_flash_mla_prefill_op(device: torch.device) -> None:
     torch.cuda.synchronize(device)
 
 
+def _warmup_flash_mla_decode_partial_op(device: torch.device) -> None:
+    """Direct tiny partial-decode op call -- see catalog entry 4."""
+    from vllm.models.deepseek_v4.ampere.flash_mla_decode import (
+        _get_flash_mla_decode_partial,
+    )
+
+    decode_partial = _get_flash_mla_decode_partial()
+    q = torch.zeros(1, 1, 512, dtype=torch.bfloat16, device=device)
+    swa_cache = torch.zeros(1, 1, 584, dtype=torch.uint8, device=device)
+    extra_cache = torch.zeros(1, 1, 584, dtype=torch.uint8, device=device)
+    ones = torch.ones(1, dtype=torch.int32, device=device)
+    zeros_idx = torch.zeros(1, 1, dtype=torch.int32, device=device)
+    decode_partial(
+        q=q,
+        swa_cache=swa_cache,
+        swa_indices=zeros_idx,
+        swa_lens=ones,
+        scale=512.0**-0.5,
+        extra_cache=extra_cache,
+        extra_indices=zeros_idx,
+        extra_lens=ones,
+    )
+    torch.cuda.synchronize(device)
+
+
+# Geometric ladder over the number of PREFILL CHUNKS a request has consumed.
+# Bucket b covers a context of b * max_num_batched_tokens tokens, i.e.
+# max_entries ~= b * chunk_tokens // compress_ratio compressed entries.
+_CHUNK_LADDER = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+
+
+def _warmup_dequant_gather_ladder(
+    device: torch.device,
+    max_model_len: int,
+    chunk_tokens: int,
+) -> None:
+    """Catalog entry 3: compile the gather kernel at every chunk bucket.
+
+    Each rung mimics ONE request's compressed-entry gather at that context
+    length: a `[1, entries]` block table (the identity/virtual-table shape both
+    DCP gather paths use) over a tiny synthetic cache. `gather_lens` is pinned
+    to a handful of rows, so the LAUNCH is microseconds regardless of the rung
+    -- only the compiled specialization scales with the rung, which is the
+    whole point. Runs on freshly allocated synthetic buffers; no model or cache
+    state is touched.
+    """
+    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+        dequantize_and_gather_k_cache_triton,
+        sm86_dcp_identity_block_table,
+    )
+
+    entry_bytes = 584
+    gather_rows = 4  # rows actually dequantized per rung (launch cost only)
+    # compress_ratio 4 is the tighter (larger max_entries) of the two
+    # compressed-layer kinds; C128A's tables are 32x smaller and hit the same
+    # specialization once max_blocks_per_seq stops specializing.
+    compress_ratio = 4
+    max_entries_cap = max(1, max_model_len // compress_ratio)
+
+    seen: set[int] = set()
+    for chunks in _CHUNK_LADDER:
+        entries = min(chunks * chunk_tokens // compress_ratio, max_entries_cap)
+        entries = max(entries, gather_rows)
+        if entries in seen:
+            continue
+        seen.add(entries)
+        # block_size=1 staging layout (DCP all-gather + P7 delta stagings).
+        # Only rows [0, gather_rows) are ever dereferenced -- the rung's SIZE
+        # lives in the block table's WIDTH, which is what specializes -- so the
+        # cache stays a few KiB no matter how long the ladder gets.
+        cache = torch.zeros(
+            gather_rows, 1, entry_bytes, dtype=torch.uint8, device=device
+        )
+        out = torch.zeros(1, gather_rows, 512, dtype=torch.bfloat16, device=device)
+        lens = torch.full((1,), gather_rows, dtype=torch.int32, device=device)
+        dequantize_and_gather_k_cache_triton(
+            out,
+            cache,
+            seq_lens=lens,
+            gather_lens=None,
+            block_table=sm86_dcp_identity_block_table(entries, device),
+            block_size=1,
+            offset=0,
+            use_fnuz=False,
+        )
+        if entries >= max_entries_cap:
+            break
+    torch.cuda.synchronize(device)
+    logger.info(
+        "DSV4 SM8x JIT warmup: compressed-gather chunk ladder covered "
+        "max_blocks_per_seq %s.",
+        sorted(seen),
+    )
+
+
 def dsv4_sm86_warmup(worker: "Worker") -> None:
     """Run the P6 warmup catalog (VLLM_DSV4_WARMUP, default on)."""
     if not envs.VLLM_DSV4_WARMUP:
@@ -115,10 +231,12 @@ def dsv4_sm86_warmup(worker: "Worker") -> None:
     if not _has_sm86_dsv4_backend(runner):
         return
 
-    # Catalog entry 2 first: a broken flash_mla install must fail here, with
-    # the build command, not inside the dummy run's stack.
+    # Catalog entries 2 and 4 first: a broken flash_mla install must fail
+    # here, with the build command, not inside the dummy run's stack.
     if envs.VLLM_DSV4_FLASH_PREFILL:
         _warmup_flash_mla_prefill_op(runner.device)
+    if envs.VLLM_DSV4_FLASH_DECODE:
+        _warmup_flash_mla_decode_partial_op(runner.device)
 
     # Catalog entry 1: min and max chunk sizes through the real path. The
     # v2-vs-v1 runner split mirrors deepseek_v4_sparse_mla_attention_warmup.
@@ -129,6 +247,23 @@ def dsv4_sm86_warmup(worker: "Worker") -> None:
     max_tokens = worker.scheduler_config.max_num_batched_tokens
     if max_tokens <= 0:
         return
+
+    # Catalog entry 3: the chunk-count ladder. Cheap (one compile with the
+    # P9 pin in place) and it must run BEFORE the dummy runs so a regression
+    # in the pin shows up here, attributed, rather than smeared across them.
+    try:
+        _warmup_dequant_gather_ladder(
+            runner.device,
+            worker.model_config.max_model_len,
+            max_tokens,
+        )
+    except Exception:  # pragma: no cover - warmup must never break boot
+        logger.warning(
+            "DSV4 SM8x JIT warmup: compressed-gather chunk ladder failed; "
+            "continuing (the buckets will compile inside the first requests "
+            "that reach them).",
+            exc_info=True,
+        )
     token_sizes = sorted({min(_MIN_WARMUP_TOKENS, max_tokens), max_tokens})
     logger.info(
         "DSV4 SM8x JIT warmup: mixed dummy runs at token sizes %s.", token_sizes
