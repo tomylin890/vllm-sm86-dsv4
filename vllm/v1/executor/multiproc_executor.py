@@ -1020,6 +1020,22 @@ class WorkerProc:
                 # string, only for logging purpose.
                 if output_rank is None or self.rank == output_rank:
                     self.handle_output(e)
+                else:
+                    # A rank that cannot report MUST NOT silently continue.
+                    # output_rank is non-None only for the collective
+                    # execution RPCs (execute_model / sample_tokens /
+                    # execute_dummy_batch / take_draft_token_ids). This rank
+                    # has already consumed its half of the step's
+                    # communication and is about to skip the other half (the
+                    # PP isend in gpu_worker.execute_model). Dropping one
+                    # send permanently offsets the downstream stage's recv
+                    # stream by one step; the offset is INVISIBLE whenever
+                    # consecutive steps have equal token counts and silently
+                    # produces wrong output, detonating much later as an
+                    # unrelated shape mismatch. Escape the busy loop so
+                    # worker_main logs "WorkerProc failed." and the parent
+                    # monitor tears the engine down with THIS traceback.
+                    raise
 
     @staticmethod
     def setup_proc_title_and_log_prefix(enable_ep: bool) -> None:
