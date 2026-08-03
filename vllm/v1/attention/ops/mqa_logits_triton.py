@@ -22,6 +22,51 @@ _PREFILL_AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK_N": 128}, num_warps=4, num_stages=ns) for ns in (2, 4)
 ]
 
+# P6 (VLLM_DSV4_SM86_INDEXER_TILES): the consumer fork's SM86 (RTX 3090 /
+# A5000) tiles for this kernel family. The fork launches its prefill logits
+# kernel at BLOCK_N=64 / num_warps=4 with Triton's default num_stages=3
+# (ref: nvidia_imma/triton_kernels.py, fp8_mqa_logits_triton), and its paged
+# kernel at num_warps=4 / default stages. TILING/PIPELINING ONLY -- the
+# reduction blocks are deliberately NOT transplanted:
+#   - BLOCK_D (the tl.dot k-dim, our "BLOCK_K") stays next_pow2(head_dim):
+#     the fork chunks head_dim at BLOCK_D=64 with `scores +=` across chunks,
+#     which SPLITS the fp32 dot accumulation and changes rounding. Our single
+#     full-width dot is kept, so every output element's FMA chain and its
+#     masked-lane zero contributions are unchanged.
+#   - BLOCK_H (the head-sum axis) is structural and unchanged.
+# BLOCK_N only partitions independent output columns. A single fixed config
+# also removes the 2-config autotune benchmark -- one less boot-to-boot
+# nondeterminism source on the A/B path.
+_SM86_PREFILL_TILE_CONFIGS = [
+    triton.Config({"BLOCK_N": 64}, num_warps=4, num_stages=3)
+]
+_SM86_PAGED_TILE_CONFIGS = [triton.Config({}, num_warps=4, num_stages=3)]
+
+_sm86_tiles_enabled: bool | None = None
+_paged_kernel_sm86 = None
+_prefill_kernel_sm86 = None
+
+
+def _use_sm86_indexer_tiles() -> bool:
+    """VLLM_DSV4_SM86_INDEXER_TILES on a compute-capability-8.6 device."""
+    global _sm86_tiles_enabled
+    if _sm86_tiles_enabled is None:
+        from vllm import envs
+
+        if not envs.VLLM_DSV4_SM86_INDEXER_TILES:
+            # Flag off: never touch the platform (no early CUDA init).
+            _sm86_tiles_enabled = False
+        else:
+            from vllm.platforms import current_platform
+
+            capability = current_platform.get_device_capability()
+            _sm86_tiles_enabled = (
+                capability is not None
+                and capability.major == 8
+                and capability.minor == 6
+            )
+    return _sm86_tiles_enabled
+
 # Warmup shape mirrors the chunked-prefill regime (small M, long N) so
 # autotune picks a tile sized for real serving rather than a launch-overhead-
 # dominated dummy grid.
@@ -150,6 +195,25 @@ def _fp8_paged_mqa_logits_kernel(
     )
 
 
+def _get_paged_mqa_logits_kernel():
+    """The paged kernel with the tile source for this device (P6).
+
+    Default: the SM80-swept autotune sweep above. Under
+    VLLM_DSV4_SM86_INDEXER_TILES on an 8.6 device: the same JIT function
+    (`.fn` -- identical Triton source, so identical math per element)
+    re-wrapped with the fork's single fixed SM86 config.
+    """
+    global _paged_kernel_sm86
+    if not _use_sm86_indexer_tiles():
+        return _fp8_paged_mqa_logits_kernel
+    if _paged_kernel_sm86 is None:
+        _paged_kernel_sm86 = triton.autotune(
+            configs=_SM86_PAGED_TILE_CONFIGS,
+            key=["num_heads", "head_dim", "block_size"],
+        )(_fp8_paged_mqa_logits_kernel.fn)
+    return _paged_kernel_sm86
+
+
 def fp8_paged_mqa_logits_triton(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -216,7 +280,7 @@ def fp8_paged_mqa_logits_triton(
     # context_lens and returns. max_model_len here is the active batch max.
     num_block_cols = min(block_tables.shape[1], triton.cdiv(max_model_len, block_size))
     grid = (B * next_n, num_block_cols)
-    _fp8_paged_mqa_logits_kernel[grid](
+    _get_paged_mqa_logits_kernel()[grid](
         q_byte,
         kv_byte,
         kv_scale,
@@ -345,6 +409,19 @@ def _fp8_mqa_logits_kernel(
     )
 
 
+def _get_mqa_logits_kernel():
+    """Prefill twin of ``_get_paged_mqa_logits_kernel`` (P6, same policy)."""
+    global _prefill_kernel_sm86
+    if not _use_sm86_indexer_tiles():
+        return _fp8_mqa_logits_kernel
+    if _prefill_kernel_sm86 is None:
+        _prefill_kernel_sm86 = triton.autotune(
+            configs=_SM86_PREFILL_TILE_CONFIGS,
+            key=["num_heads", "head_dim"],
+        )(_fp8_mqa_logits_kernel.fn)
+    return _prefill_kernel_sm86
+
+
 def fp8_mqa_logits_triton(
     q: torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -386,7 +463,7 @@ def fp8_mqa_logits_triton(
 
     # Grid depends on the autotuned BLOCK_N.
     grid = lambda meta: (M, triton.cdiv(N, meta["BLOCK_N"]))  # noqa: E731
-    _fp8_mqa_logits_kernel[grid](
+    _get_mqa_logits_kernel()[grid](
         q_bf16,
         k_bf16,
         k_scales,

@@ -40,6 +40,10 @@ from vllm.models.deepseek_v4.amd.rocm import (
     compute_global_topk_ragged_indices_and_indptr,
 )
 from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
+from vllm.models.deepseek_v4.common.ops.cache_utils import (
+    sm86_dcp_allgather_k_entries,
+    sm86_pack_swa_window_entries,
+)
 from vllm.models.deepseek_v4.common.ops.dcp import (
     dcp_merge_flashmla_output,
     softmax_stats_to_lse,
@@ -259,6 +263,26 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
             self.PREFILL_CHUNK_SIZE
         )
 
+        if envs.VLLM_DSV4_FLASH_PREFILL:
+            # P6: same chunking, same metadata, but the dequant workspace,
+            # combine_topk_swa_indices and the Triton prefill kernel are
+            # replaced by one fused flash-mla op per chunk. The compressed
+            # pack + all-gather is IDENTICAL to the path below (shared
+            # helper); only the dequant is skipped -- the op dequantizes the
+            # staging bytes in-kernel, exactly once (rule 8).
+            self._forward_prefill_dcp_flash(
+                q=q,
+                compressed_k_cache=compressed_k_cache,
+                swa_k_cache=swa_k_cache,
+                output=output,
+                attn_metadata=attn_metadata,
+                swa_metadata=swa_metadata,
+                dcp_group=dcp_group,
+                topk_indices=topk_indices,
+                num_chunks=num_chunks,
+            )
+            return
+
         workspace_manager = current_workspace_manager()
         kv = workspace_manager.get_simultaneous(
             ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
@@ -334,6 +358,127 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
                 rope_head_dim=self.rope_head_dim,
                 attn_sink=self.attn_sink,
                 output=output[query_start:query_end],
+            )
+
+    def _forward_prefill_dcp_flash(
+        self,
+        q: torch.Tensor,
+        compressed_k_cache: torch.Tensor,
+        swa_k_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: DeepseekV4ROCMAiterMLASparseMetadata,
+        swa_metadata: DeepseekV4ROCMAiterSparseSWAMetadata,
+        dcp_group: "GroupCoordinator",
+        topk_indices: torch.Tensor,
+        num_chunks: int,
+    ) -> None:
+        """P6 (VLLM_DSV4_FLASH_PREFILL): fused flash-mla DCP prefill.
+
+        Per chunk: pack + all-gather the compressed shard bytes (the SAME
+        helper the Triton path uses -- dequant skipped), byte-pack the
+        replicated SWA window, translate the producer's GLOBAL entry ids to
+        flat staging rows through the memoized P4 map, and run ONE
+        ``fwd_sparse_prefill_mla`` call: single softmax over SWA window +
+        top-k entries, sink folded once in-kernel (rules 1/6/8; section 6).
+        No bf16 dequant workspace, no combine_topk_swa_indices.
+
+        Eager-only like the parent (same host-sync-sized collective); the
+        capture guard already fired in ``_forward_prefill_dcp``.
+        """
+        from vllm.models.deepseek_v4.ampere.flash_mla_prefill import (
+            sparse_prefill_via_flash_mla,
+        )
+
+        num_prefills = swa_metadata.num_prefills
+        num_decodes = swa_metadata.num_decodes
+
+        seq_lens = swa_metadata.prefill_seq_lens
+        gather_lens = swa_metadata.prefill_gather_lens
+        seq_lens_cpu = swa_metadata.prefill_seq_lens_cpu
+        query_start_loc_cpu = swa_metadata.query_start_loc_cpu
+        query_start_loc = swa_metadata.query_start_loc
+        assert seq_lens is not None and gather_lens is not None
+        assert seq_lens_cpu is not None
+        assert query_start_loc_cpu is not None and query_start_loc is not None
+        prefill_token_base = query_start_loc_cpu[num_decodes]
+
+        block_table = attn_metadata.block_table[num_decodes:]
+        swa_block_table = swa_metadata.block_table[num_decodes:]
+
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * self.PREFILL_CHUNK_SIZE
+            chunk_end = min(chunk_start + self.PREFILL_CHUNK_SIZE, num_prefills)
+
+            # Host bounds (CPU tensors; rank-invariant; seq_lens_cpu is an
+            # upper bound, which only ever ENLARGES staging).
+            qsl_cpu = query_start_loc_cpu[
+                num_decodes + chunk_start : num_decodes + chunk_end + 1
+            ]
+            max_qlen = int((qsl_cpu[1:] - qsl_cpu[:-1]).max().item())
+            max_seq = int(seq_lens_cpu[chunk_start:chunk_end].max().item())
+            max_entries = max_seq // self.compress_ratio
+            # gather_len = query_len + min(prefix, window-1) per the
+            # sparse_swa builder, so this bounds every chunk row.
+            max_gather = min(max_seq, max_qlen + self.window_size - 1)
+
+            # Compressed stream: pack + all-gather (skip symmetric at 0).
+            gathered_rows = None
+            virtual_block_table = None
+            max_local = 0
+            if max_entries > 0:
+                gathered_rows, virtual_block_table, max_local = (
+                    sm86_dcp_allgather_k_entries(
+                        compressed_k_cache,
+                        seq_lens[chunk_start:chunk_end] // self.compress_ratio,
+                        block_table[chunk_start:chunk_end],
+                        attn_metadata.block_size // self.compress_ratio,
+                        dcp_group,
+                        self._cp_interleave,
+                        max_entries,
+                    )
+                )
+
+            # Replicated (dcp_exempt) SWA window: byte-pack, no collective.
+            swa_staging_rows = sm86_pack_swa_window_entries(
+                swa_k_cache,
+                seq_lens[chunk_start:chunk_end],
+                gather_lens[chunk_start:chunk_end],
+                swa_block_table[chunk_start:chunk_end],
+                swa_metadata.block_size,
+                max_gather,
+            )
+
+            query_start = (
+                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
+            )
+            query_end = (
+                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+            )
+
+            sparse_prefill_via_flash_mla(
+                q[query_start:query_end],
+                swa_staging_rows=swa_staging_rows,
+                max_gather=max_gather,
+                seq_lens=seq_lens[chunk_start:chunk_end],
+                gather_lens=gather_lens[chunk_start:chunk_end],
+                window_size=self.window_size,
+                compressed_staging_rows=gathered_rows,
+                virtual_block_table=virtual_block_table,
+                max_local=max_local,
+                max_entries=max_entries,
+                topk_indices=(
+                    topk_indices[query_start:query_end]
+                    if gathered_rows is not None
+                    else None
+                ),
+                compress_ratio=self.compress_ratio,
+                query_start_loc=query_start_loc[
+                    num_decodes + chunk_start : num_decodes + chunk_end + 1
+                ],
+                scale=self.scale,
+                attn_sink=self.attn_sink,
+                output=output[query_start:query_end],
+                forbidden_pools=(compressed_k_cache, swa_k_cache),
             )
 
     def _forward_decode(

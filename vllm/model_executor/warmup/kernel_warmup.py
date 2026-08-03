@@ -145,6 +145,13 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
     deepseek_v4_sparse_mla_attention_warmup(worker)
 
+    # P6 catalog: DSV4 SM8x prefill/decode JIT warmup at min/max chunk sizes
+    # (+ the flash-mla prefill op when VLLM_DSV4_FLASH_PREFILL). Gated on
+    # VLLM_DSV4_WARMUP (default on) and self-gated on the SM8x DSV4 backend.
+    from vllm.model_executor.warmup.dsv4_sm86_warmup import dsv4_sm86_warmup
+
+    dsv4_sm86_warmup(worker)
+
     # Deep GEMM warmup
     do_deep_gemm_warmup = (
         envs.VLLM_USE_DEEP_GEMM

@@ -125,6 +125,9 @@ if TYPE_CHECKING:
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_SM86_DCP: bool = False
     VLLM_SM86_DET_TOPK: bool = False
+    VLLM_DSV4_FLASH_PREFILL: bool = False
+    VLLM_DSV4_WARMUP: bool = True
+    VLLM_DSV4_SM86_INDEXER_TILES: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
@@ -1197,6 +1200,39 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # byte-for-byte unchanged when this is unset.
     "VLLM_SM86_DET_TOPK": lambda: (
         os.getenv("VLLM_SM86_DET_TOPK", "False").lower() in ("true", "1")
+    ),
+    # P6: route the SM8x DSV4 DCP compressed-layer PREFILL attention through
+    # the flash-mla fused sparse-prefill CUDA op (fwd_sparse_prefill_mla)
+    # instead of the Triton dequant-workspace pipeline. Requires the
+    # `flash_mla` package built from source with FLASH_MLA_CUDA_ARCHS=86 and
+    # only takes effect together with VLLM_SM86_DCP and dcp>1. Default off:
+    # all default code paths are byte-for-byte unchanged when this is unset.
+    "VLLM_DSV4_FLASH_PREFILL": lambda: (
+        os.getenv("VLLM_DSV4_FLASH_PREFILL", "False").lower() in ("true", "1")
+    ),
+    # P6: DSV4 SM8x JIT warmup catalog. Runs the resolved sparse-MLA
+    # prefill/decode kernel family (mixed dummy batches at the min and max
+    # chunk sizes, which under VLLM_SM86_DCP also compiles the DCP
+    # pack/all-gather/dequant kernels, and — when VLLM_DSV4_FLASH_PREFILL is
+    # on — the flash-mla sparse prefill op) once at engine init so no Triton
+    # JIT or first-call op load lands inside a measured request. Default ON:
+    # the warmup only launches kernels over freshly allocated synthetic
+    # buffers via the profile-mode dummy-run path (is_profile=True), touches
+    # no model or cache state, and none of the warmed kernels are autotuned,
+    # so results are unchanged whether or not it runs.
+    "VLLM_DSV4_WARMUP": lambda: (
+        os.getenv("VLLM_DSV4_WARMUP", "True").lower() in ("true", "1")
+    ),
+    # P6: use the consumer fork's SM86 (RTX 3090 / A5000) tile configs for
+    # the fp8 MQA logits Triton kernel family (indexer fallback in
+    # vllm/v1/attention/ops/mqa_logits_triton.py) instead of the A100/SM80
+    # autotune sweep. Tiling/pipelining only — the reduction block sizes
+    # (BLOCK_D, BLOCK_H) are unchanged so per-element accumulation chains are
+    # preserved; also removes the 2-config autotune benchmark, which is a
+    # boot-to-boot nondeterminism source. Only takes effect on devices
+    # reporting compute capability 8.6. Default off.
+    "VLLM_DSV4_SM86_INDEXER_TILES": lambda: (
+        os.getenv("VLLM_DSV4_SM86_INDEXER_TILES", "False").lower() in ("true", "1")
     ),
     # Optional: enable external Oink custom ops (e.g., Blackwell RMSNorm).
     # Disabled by default.
