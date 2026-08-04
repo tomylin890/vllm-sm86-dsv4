@@ -124,14 +124,66 @@ class Sm86DcpDeltaTracker:
         self._budget = get_delta_gather_budget()
         Sm86DcpDeltaTracker._instances.append(self)
 
+    # Consecutive-absence counts, shared across layers (all trackers see the
+    # same live set each step, so one counter map suffices). A request is
+    # freed only after _GRACE consecutive steps absent from the FULL
+    # scheduled set (prefill AND decode rows): the scheduler legitimately
+    # skips a live request for a step (PP decode cadence, DP deferral,
+    # zero-token steps), so first-absence freeing is unsound the moment
+    # prefills co-schedule. Finished/aborted requests never reappear, so
+    # they are freed exactly _GRACE steps late -- bounded, tiny.
+    _absence: "dict[str, int]" = {}
+    _GRACE = 3
+
     @classmethod
-    def gc_all(cls, live_prefill_req_ids: "list[str]") -> None:
-        """Step-level GC over every layer's tracker (rank-symmetric)."""
+    def gc_all(
+        cls,
+        live_req_ids: "list[str]",
+        prefill_req_ids: "list[str]",
+    ) -> None:
+        """Step-level GC over every layer's tracker (rank-symmetric).
+
+        ``live_req_ids`` is the FULL scheduled set (decode rows included);
+        ``prefill_req_ids`` the prefill subset. Three verdicts per tracked
+        request:
+        - in the prefill rows: alive, staging in use -- keep;
+        - present ONLY as a decode row: prefill provably finished (decode
+          never reads staging, and a request cannot return to prefill) --
+          free IMMEDIATELY;
+        - absent entirely: could be finished OR merely skipped this step
+          (PP decode cadence, DP deferral, zero-token steps) -- free only
+          after _GRACE consecutive absences. Runs on decode-only steps
+          too, fixing the budget leak where dead stagings survived until
+          the next step that happened to carry a prefill row.
+        """
+        live = set(live_req_ids)
+        prefilling = set(prefill_req_ids)
+        tracked: set[str] = set()
+        for tracker in cls._instances:
+            tracked.update(tracker._states)
+        for req_id in list(cls._absence):
+            if req_id in live or req_id not in tracked:
+                cls._absence.pop(req_id, None)
+        doomed: list[str] = []
+        for req_id in tracked:
+            if req_id in prefilling:
+                continue
+            if req_id in live:
+                doomed.append(req_id)  # decoding: staging is dead weight
+                continue
+            n = cls._absence.get(req_id, 0) + 1
+            cls._absence[req_id] = n
+            if n >= cls._GRACE:
+                doomed.append(req_id)
         freed_any = False
         for tracker in cls._instances:
             before = len(tracker._states)
-            tracker.gc(live_prefill_req_ids)
+            for req_id in doomed:
+                if req_id in tracker._states:
+                    tracker._free(req_id)
             freed_any = freed_any or len(tracker._states) < before
+        for req_id in doomed:
+            cls._absence.pop(req_id, None)
         if freed_any:
             # Request boundary: hundreds of MiB of staging plus a long
             # prefill's transients were just freed, but the caching

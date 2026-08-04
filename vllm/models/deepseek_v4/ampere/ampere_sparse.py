@@ -466,7 +466,12 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
             return None
         if self._delta_gather_tracker is None:
             self._delta_gather_tracker = Sm86DcpDeltaTracker(device)
-        self._delta_gather_tracker.gc(prefill_req_ids)
+        # GC intentionally NOT called here: the sparse-SWA builder invokes
+        # Sm86DcpDeltaTracker.gc_all on EVERY step (decode-only included)
+        # with the full scheduled set and a grace period. A per-layer
+        # "absent from this step's prefill rows" free would wrongly kill a
+        # co-scheduled prefill that got zero tokens this step (possible at
+        # 3+ concurrent prefills under long_prefill_token_threshold).
         return self._delta_gather_tracker
 
     def _plan_delta_chunk(

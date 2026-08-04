@@ -755,23 +755,35 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 and self.vllm_config.parallel_config.decode_context_parallel_size
                 > 1
             ):
-                prefill_req_ids = list(
+                result["prefill_req_ids"] = list(
                     req_ids[num_decodes : num_decodes + num_prefills]
                 )
-                result["prefill_req_ids"] = prefill_req_ids
-                # Free finished requests' staging across ALL layer trackers
-                # BEFORE any layer executes. The per-layer GC inside the
-                # attention forward runs AFTER that layer's indexer, so on
-                # the first prefill step of a new long request the indexer's
-                # merge transients would otherwise coexist with the previous
-                # request's full staging (~hundreds of MiB at 200k ctx) --
-                # observed as OOM in _sm86_dcp_global_topk on the second
-                # 200k request. Builder runs on every rank with identical
-                # req_ids, so GC stays rank-symmetric; dummy/warmup/capture
-                # runs never reach here (req_ids is None).
-                from vllm.models.deepseek_v4.ampere.dcp_delta_tracker import (
-                    Sm86DcpDeltaTracker)
-                Sm86DcpDeltaTracker.gc_all(prefill_req_ids)
+
+        # P7 GC, EVERY build (decode-only steps included). Free finished
+        # requests' staging across ALL layer trackers BEFORE any layer
+        # executes: the per-layer GC inside the attention forward runs
+        # AFTER that layer's indexer, so on the first prefill step of a
+        # new long request the indexer's merge transients would otherwise
+        # coexist with the previous request's full staging (~hundreds of
+        # MiB at 200k ctx) -- observed as OOM in _sm86_dcp_global_topk on
+        # the second 200k request. Passing the FULL scheduled set plus
+        # the prefill subset lets the tracker free decode-phase stagings
+        # immediately and finished ones after a grace period, fixing the
+        # decode-only-step budget leak. Builder runs on every rank with
+        # identical req_ids (rank-symmetric); dummy/warmup/capture runs
+        # never reach here (req_ids is None).
+        if (
+            req_ids is not None
+            and envs.VLLM_SM86_DCP
+            and envs.VLLM_DSV4_DELTA_GATHER
+            and self.vllm_config.parallel_config.decode_context_parallel_size > 1
+        ):
+            from vllm.models.deepseek_v4.ampere.dcp_delta_tracker import (
+                Sm86DcpDeltaTracker)
+            Sm86DcpDeltaTracker.gc_all(
+                list(req_ids),
+                list(req_ids[num_decodes : num_decodes + num_prefills]),
+            )
 
         return result
 
