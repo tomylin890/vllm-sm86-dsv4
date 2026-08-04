@@ -6,7 +6,6 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import ClassVar
 
-from vllm import envs
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -14,6 +13,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashListWithBlockSize,
     BlockHashWithGroupId,
     KVCacheBlock,
+    is_dcp_exempt_spec,
     resolve_block_hashes,
 )
 from vllm.v1.kv_cache_interface import (
@@ -22,7 +22,6 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheSpec,
-    KVCacheSpecKind,
     MambaSpec,
     MLAAttentionSpec,
     RSWASpec,
@@ -30,7 +29,6 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     TQFullAttentionSpec,
-    get_kv_cache_spec_kind,
     get_kv_cache_spec_state_window,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
@@ -79,17 +77,12 @@ class SingleTypeKVCacheManager(ABC):
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        # Kind-based (not isinstance) to stay robust if a caller ever hands
-        # this manager a UniformTypeKVCacheSpecs-wrapped spec (the worker
-        # side already does; get_kv_cache_spec_kind recurses the wrapper).
-        if dcp_world_size > 1 and not (
-            envs.VLLM_SM86_DCP
-            and get_kv_cache_spec_kind(kv_cache_spec)
-            in (
-                KVCacheSpecKind.SLIDING_WINDOW,
-                KVCacheSpecKind.SLIDING_WINDOW_MLA,
-            )
-        ):
+        # `is_dcp_exempt_spec` is the one predicate shared with
+        # `resolve_kv_cache_block_sizes`, so the scheduler-side group block
+        # sizes and this manager's real block size cannot disagree (the
+        # coordinator asserts the latter divides the hash block size derived
+        # from the former).
+        if dcp_world_size > 1 and not is_dcp_exempt_spec(kv_cache_spec):
             # Under DCP each rank stores 1/dcp of a group's tokens, so one
             # logical block covers block_size * dcp tokens.
             # VLLM_SM86_DCP (DeepseekV4-sparse hybrid DCP): sliding-window
@@ -952,9 +945,15 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # (rather than relying on `apply_admission_cap`, which the caller
         # controls) is what guarantees the block-table row -- exactly
         # `ring_blocks` columns wide -- can never be overrun.
-        assert not new_computed_blocks, (
-            "P8 windowed compressor state is incompatible with prefix caching"
-        )
+        # A raise, not an assert: `python -O` strips asserts, and the failure
+        # this guards is silent memory corruption rather than a crash.
+        # `add_local_computed_blocks` is not overridden for the ring, so
+        # computed blocks would extend `req_to_blocks` past `ring_blocks` and
+        # overrun a block-table row that is exactly `ring_blocks` columns wide.
+        if new_computed_blocks:
+            raise NotImplementedError(
+                "P8 windowed compressor state is incompatible with prefix caching"
+            )
         already = len(self.req_to_blocks.get(request_id, ()))
         return max(self.ring_blocks - already, 0)
 
@@ -1001,6 +1000,30 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         super().allocate_external_computed_blocks(
             request_id, num_local_computed_tokens, num_external_computed_tokens
         )
+
+    def cache_blocks(
+        self,
+        request: Request,
+        num_tokens: int,
+        retention_interval: int | None = None,
+    ) -> None:
+        # Write-side counterpart of the two guards above. The base
+        # implementation derives `num_full_blocks` from `num_tokens`, but a
+        # ring row only ever holds `ring_blocks` blocks, so it would register
+        # the ring's blocks under the hashes of the tokens they no longer hold
+        # once the ring has wrapped (Python slicing truncates silently).
+        # `reachable_block_mask` trips first -- it builds a
+        # `num_full_blocks`-long mask against that much shorter row, failing
+        # `cache_full_blocks`'s block-mask length assertion -- but neither is
+        # a guarantee, so refuse here. Unreachable with prefix caching off:
+        # `KVCacheManager` only calls this when `enable_caching` is set.
+        if self.ring_blocks is not None:
+            raise NotImplementedError(
+                "VLLM_DSV4_COMPRESSOR_WINDOWED: the windowed fp32 compressor "
+                "state cannot be prefix-cached -- a ring slot is keyed by "
+                "absolute position modulo the window, not by prefix."
+            )
+        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)
 
     @classmethod
     def _contiguous_blocks_for_hit(

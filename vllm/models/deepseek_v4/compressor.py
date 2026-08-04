@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -10,6 +11,7 @@ from torch import nn
 import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
@@ -32,6 +34,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
@@ -39,6 +42,8 @@ from vllm.v1.kv_cache_interface import (
 
 if TYPE_CHECKING:
     from vllm.models.deepseek_v4.eager_scratch import DeepseekV4EagerScratchPool
+
+logger = init_logger(__name__)
 
 
 def _prefer_two_stage_compressor() -> bool:
@@ -177,6 +182,13 @@ def get_compressor_state_window(vllm_config: VllmConfig) -> int | None:
       must be >= 1 for the widest window.
     * prefix caching must be off: a ring is not prefix-addressable, so a
       cache hit would hand the request rows that were never recomputed.
+      The ring and prefix caching are a PRODUCT SWITCH, not a preference:
+      PROFILE-P8 (ring, caching off) and PROFILE-CACHE (default
+      absolute-position placement, caching on) differ in per-request state
+      reservation by hundreds of blocks, so a conflict is refused here
+      rather than silently degraded to ``None`` -- degrading it would move
+      the KV footprint by gigabytes and only resurface much later as an
+      admission refusal or an OOM (P11-DESIGN.md step 4).
     """
     if not envs.VLLM_DSV4_COMPRESSOR_WINDOWED:
         return None
@@ -188,11 +200,21 @@ def get_compressor_state_window(vllm_config: VllmConfig) -> int | None:
         )
     if vllm_config.cache_config.enable_prefix_caching:
         raise ValueError(
-            "VLLM_DSV4_COMPRESSOR_WINDOWED requires prefix caching to be "
-            "disabled (--no-enable-prefix-caching): the windowed fp32 "
-            "compressor state is a ring keyed by absolute position modulo "
-            "the window, not a prefix-addressable cache, so a prefix-cache "
-            "hit would skip recomputing rows the compression kernel reads."
+            "VLLM_DSV4_COMPRESSOR_WINDOWED and prefix caching are mutually "
+            "exclusive: the windowed fp32 compressor state is a ring keyed "
+            "by absolute position modulo the window, not a prefix-"
+            "addressable cache, so a prefix-cache hit would skip recomputing "
+            "rows the compression kernel reads. Pick one of the two "
+            "supported serving profiles. PROFILE-P8: keep "
+            "VLLM_DSV4_COMPRESSOR_WINDOWED=1 and add "
+            "--no-enable-prefix-caching; the ring pins the per-request state "
+            "reservation at cdiv(W, block_size), so max_num_batched_tokens "
+            "can stay at 1024. PROFILE-CACHE: unset "
+            "VLLM_DSV4_COMPRESSOR_WINDOWED to fall back to the "
+            "prefix-cacheable absolute-position placement and keep prefix "
+            "caching on; that reservation grows with max_num_batched_tokens, "
+            "so cap it at 512. The conflict is never resolved silently -- "
+            "either resolution changes the KV footprint by gigabytes."
         )
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         # _promote_local_kv_cache_specs rebuilds SlidingWindowMLASpec as
@@ -209,6 +231,179 @@ def get_compressor_state_window(vllm_config: VllmConfig) -> int | None:
             "state writer from the compressor reader."
         )
     return window
+
+
+def _compressor_state_compress_ratio(spec: SlidingWindowMLASpec) -> int | None:
+    """The compressor's ``m`` for an fp32 compressor-state group, else None.
+
+    ``CompressorStateCache`` derives the state window as
+    ``coff * compress_ratio`` with ``coff = 1 + (compress_ratio == 4)``, so a
+    window of 8 is the overlapped C4 family (m = 4) and every other window
+    equals its own compress ratio. The SWA KV group is a SlidingWindowMLASpec
+    too, but it holds real KV (uint8 / bfloat16 / fp8) rather than fp32 state
+    and has no compressor behind it, so it has no ``m``.
+
+    The inverse is ambiguous in principle (a window of 8 could also be a
+    non-overlapped m = 8), but harmlessly so: ``m`` always divides the window,
+    so the compress-ratio leg of the validation is implied by its window leg
+    whichever ``m`` a window came from.
+    """
+    if spec.dtype != torch.float32:
+        return None
+    return 4 if spec.sliding_window == 8 else spec.sliding_window
+
+
+def validate_compressor_lookback_coverage(
+    kv_cache_specs: Iterable[KVCacheSpec],
+    scheduler_block_size: int,
+    use_eagle: bool = False,
+) -> None:
+    """P11 I1/I2: a prefix-cache hit must cover the compression lookback.
+
+    The compression kernel gathers state rows ``[p - (1 + OVERLAP) * m + 1,
+    p]`` at every boundary position ``p`` with ``(p + 1) % m == 0``
+    (``fused_compress_quant_cache.py``), i.e. ``L = sliding_window`` rows, of
+    which ``L - m`` fall BELOW the position the request resumes from. Those
+    rows are never recomputed by the resumed pass, and a freshly allocated
+    state block is not zeroed (SlidingWindowMLASpec is excluded from
+    ``_record_new_block_ids``), so reading them uninitialized is an Inf/NaN
+    hazard rather than a small drift. What makes the resume correct is not a
+    trim but the SWA cache-hit geometry: ``SlidingWindowManager`` reserves
+    ``_contiguous_blocks_for_hit`` REAL blocks ending at the hit boundary
+    ``H`` for every sliding-window group, and ``H`` is a multiple of the
+    scheduler block size.
+
+    Checked for every sliding-window group (both compressor-state families
+    and the SWA KV group):
+
+    * ``_contiguous_blocks_for_hit(L, block_size, use_eagle) * block_size >=
+      L - 1`` -- the reserved tail covers the lookback. ``L - 1`` is the
+      strict bound; the ``L - m`` rows actually read below ``H`` are a subset.
+      Today's ``cdiv(L - 1, block_size)`` satisfies this by construction, so
+      this leg exists to pin that formula: it trips the moment the cache-hit
+      path reserves less than the lookback.
+    * ``scheduler_block_size % L == 0``.
+    * ``scheduler_block_size % m == 0`` -- ``H`` is a multiple of the
+      scheduler block size, hence of ``m``, so the first recomputed boundary
+      is ``p = H + m - 1`` and its gather starts exactly at ``H - (L - m)``.
+      Kept explicit for the error message; ``m`` divides ``L``, so the window
+      leg above already implies it.
+
+    ``use_eagle`` defaults to False, which is the strict case: eagle only
+    adds one contiguous block (and drops the last matched one), so a geometry
+    that satisfies the invariant without eagle satisfies it with eagle.
+
+    Today all three hold by arithmetic coincidence of 1024 / 128 / 8 / 4;
+    this is what fails loudly if a block size, window or compress ratio
+    moves. Config time only -- nothing here runs per step.
+    """
+    # Local import: the model module must not pull vllm.v1.core at import
+    # time, and this runs once per KV cache config.
+    from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+
+    for spec in kv_cache_specs:
+        if not isinstance(spec, SlidingWindowMLASpec):
+            continue
+        window = spec.sliding_window
+        # Deliberately the manager's own helper rather than a copy of its
+        # cdiv: the invariant is about what the cache-hit path actually
+        # reserves, so a change to that formula must trip this check.
+        contiguous_blocks = SlidingWindowManager._contiguous_blocks_for_hit(
+            window, spec.block_size, use_eagle
+        )
+        covered_tokens = contiguous_blocks * spec.block_size
+        if covered_tokens < window - 1:
+            raise ValueError(
+                "DeepseekV4 prefix caching requires every sliding-window "
+                "group's cache-hit reservation to cover the compression "
+                f"lookback: group (block_size={spec.block_size}, "
+                f"sliding_window={window}) reserves {contiguous_blocks} "
+                f"contiguous blocks = {covered_tokens} tokens at a hit "
+                f"boundary, short of the {window - 1} tokens below it that "
+                "the kernel's lookback can reach."
+            )
+        if scheduler_block_size % window != 0:
+            raise ValueError(
+                "DeepseekV4 prefix caching requires the scheduler block size "
+                f"({scheduler_block_size}) to be a multiple of every "
+                "sliding-window group's window; group "
+                f"(block_size={spec.block_size}, sliding_window={window}) "
+                "would put cache-hit boundaries inside a window."
+            )
+        compress_ratio = _compressor_state_compress_ratio(spec)
+        if compress_ratio is not None and scheduler_block_size % compress_ratio != 0:
+            raise ValueError(
+                "DeepseekV4 prefix caching requires the scheduler block size "
+                f"({scheduler_block_size}) to be a multiple of the compress "
+                f"ratio ({compress_ratio}) of the compressor-state group "
+                f"(block_size={spec.block_size}, sliding_window={window}); "
+                "otherwise a cache-hit boundary lands mid-entry and the "
+                "first recomputed boundary gathers rows no pass writes."
+            )
+
+
+def check_compressor_kv_cache_config(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> None:
+    """P11 post-KV-cache-config hook: log the profile, check the invariants.
+
+    Called from ``GPUModelRunner.may_reinitialize_input_batch`` once the KV
+    cache groups are final, which is the earliest point where the scheduler /
+    hash block sizes are resolvable. Everything here is a pure function of
+    ``vllm_config`` and the KV cache groups -- both rank-invariant, the
+    groups differing across ranks only in layer names -- so every rank logs
+    and validates the same thing (DCP symmetry).
+    """
+    # Local import: same reason as in validate_compressor_lookback_coverage.
+    from vllm.v1.core.kv_cache_utils import (
+        generate_scheduler_kv_cache_config,
+        resolve_kv_cache_block_sizes,
+    )
+
+    # Worker-side groups carry aggregated UniformTypeKVCacheSpecs; the
+    # scheduler view replaces each by a representative per-layer spec (all
+    # members of a group share block size, window and dtype), and that view
+    # is what the scheduler's own block sizes are resolved from.
+    scheduler_view = generate_scheduler_kv_cache_config([kv_cache_config])
+    scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+        scheduler_view, vllm_config
+    )
+    specs = [group.kv_cache_spec for group in scheduler_view.kv_cache_groups]
+    sliding_window_specs = [
+        spec for spec in specs if isinstance(spec, SlidingWindowMLASpec)
+    ]
+
+    enable_prefix_caching = vllm_config.cache_config.enable_prefix_caching
+    ring_on = any(spec.state_window is not None for spec in sliding_window_specs)
+    if ring_on:
+        # get_compressor_state_window refuses ring + caching, so this arm is
+        # always caching-off.
+        profile = "PROFILE-P8"
+    elif enable_prefix_caching:
+        profile = "PROFILE-CACHE"
+    else:
+        profile = "PROFILE-CONTROL"
+    # Logged so the deployment matrix can be asserted from the startup log
+    # (P11 rack test T0); sliding_window_groups makes a validator that saw no
+    # groups visible instead of silently vacuous.
+    logger.info(
+        "DeepseekV4 serving profile %s (compressor-state ring: %s, prefix "
+        "caching: %s, max_num_batched_tokens: %d), scheduler_block_size=%d, "
+        "hash_block_size=%d, num_gpu_blocks=%d, sliding_window_groups=%d",
+        profile,
+        "on" if ring_on else "off",
+        "on" if enable_prefix_caching else "off",
+        vllm_config.scheduler_config.max_num_batched_tokens,
+        scheduler_block_size,
+        hash_block_size,
+        kv_cache_config.num_blocks,
+        len(sliding_window_specs),
+    )
+
+    if enable_prefix_caching:
+        # The invariant only constrains cache hits; PROFILE-P8 and
+        # PROFILE-CONTROL never resume from one.
+        validate_compressor_lookback_coverage(specs, scheduler_block_size)
 
 
 class CompressorStateCache(torch.nn.Module, AttentionLayerBase):

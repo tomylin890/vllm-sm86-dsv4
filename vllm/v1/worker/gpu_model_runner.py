@@ -7246,7 +7246,10 @@ class GPUModelRunner(
         self.reorder_batch_threshold = reduce(min_none_high, reorder_batch_thresholds)  # type: ignore[assignment]
 
     def may_reinitialize_input_batch(
-        self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
+        self,
+        kv_cache_config: KVCacheConfig,
+        kernel_block_sizes: list[int],
+        is_profiling: bool = False,
     ) -> None:
         """
         Re-initialize the input batch if the block sizes are different from
@@ -7258,7 +7261,13 @@ class GPUModelRunner(
         Args:
             kv_cache_config: The KV cache configuration.
             kernel_block_sizes: The kernel block sizes for each KV cache group.
+            is_profiling: Whether this is the minimal KV cache built for
+                CUDA graph memory profiling rather than the real one.
         """
+        # Local import: vllm.v1.core is not a worker-side dependency, and this
+        # module deliberately keeps it out of its module-level imports.
+        from vllm.v1.core.kv_cache_utils import is_dcp_exempt_spec
+
         block_sizes = []
         max_num_blocks = []
         slot_mapping_modes = []
@@ -7292,18 +7301,15 @@ class GPUModelRunner(
                 slot_mapping_modes.append(SlotMappingMode.NONE)
             else:
                 slot_mapping_modes.append(SlotMappingMode.TOKEN_TO_KV_SLOT)
-            # Kind-based (not isinstance) on purpose: DSV4 worker groups
-            # arrive wrapped in UniformTypeKVCacheSpecs, and
-            # get_kv_cache_spec_kind recurses through the wrapper while an
-            # isinstance check on the wrapper would silently never match.
-            dcp_exempt.append(
-                envs.VLLM_SM86_DCP
-                and kv_cache_spec_kind
-                in (
-                    KVCacheSpecKind.SLIDING_WINDOW,
-                    KVCacheSpecKind.SLIDING_WINDOW_MLA,
-                )
-            )
+            # The same predicate the scheduler side uses, called rather than
+            # copied: the block table built below must shard exactly the groups
+            # `resolve_kv_cache_block_sizes` and the manager scaled by dcp, or
+            # a replicated group gets a sharded row. It is kind-based (not
+            # isinstance) on purpose: DSV4 worker groups arrive wrapped in
+            # UniformTypeKVCacheSpecs, and get_kv_cache_spec_kind recurses
+            # through the wrapper while an isinstance check on the wrapper
+            # would silently never match.
+            dcp_exempt.append(is_dcp_exempt_spec(kv_cache_spec))
             # For exempt groups SlidingWindowSpec.max_num_blocks_per_req
             # returns full unsharded rows under the gate, matching the
             # replicated (shard_dcp=False) block table below.
@@ -7330,6 +7336,11 @@ class GPUModelRunner(
         # state_window (e.g. spec promotion) would desynchronize the two
         # silently -- both addresses stay in bounds, so the corruption is
         # numerically wrong fp32 state with no crash. Fail loudly instead.
+        # Same single gate as the spec builder
+        # (CompressorStateCache.get_kv_cache_spec) and the compressor reader
+        # (DeepseekCompressor.__init__), so ring + prefix caching is refused
+        # identically wherever it is asked for; reaching the refusal here
+        # means the config changed after the specs were built.
         spec_values = {w for w in state_windows if w is not None}
         if spec_values:
             from vllm.models.deepseek_v4.compressor import (
@@ -7341,6 +7352,30 @@ class GPUModelRunner(
                     f"by window={env_window} but the KV cache specs carry "
                     f"state_window values {sorted(spec_values)} -- a spec "
                     "transform dropped or rewrote the ring geometry.")
+
+        # P11: config-time hook for the DeepseekV4 compressor -- logs the
+        # active serving profile with the resolved block sizes and validates
+        # the lookback-coverage invariant that makes a prefix-cache resume
+        # correct without a trim. Gated on a SLIDING_WINDOW_MLA group (the
+        # SWA KV group and the fp32 compressor-state groups are its only
+        # constructors) so no other model pays the DeepseekV4 import, and
+        # kind-based for the same reason as the dcp_exempt check above.
+        # Skipped while profiling: the minimal KV cache built for CUDA graph
+        # capture is derived from THIS worker's layers with a forced
+        # `num_gpu_blocks_override`, so it is neither the config the scheduler
+        # resolves its block sizes from (the log line the rack tests read must
+        # be the real one, and it must appear once) nor rank-invariant, which
+        # a rank-visible raise has to be.
+        if not is_profiling and any(
+            get_kv_cache_spec_kind(group.kv_cache_spec)
+            == KVCacheSpecKind.SLIDING_WINDOW_MLA
+            for group in kv_cache_config.kv_cache_groups
+        ):
+            from vllm.models.deepseek_v4.compressor import (
+                check_compressor_kv_cache_config,
+            )
+
+            check_compressor_kv_cache_config(self.vllm_config, kv_cache_config)
 
         if (
             block_sizes != self._init_block_sizes
@@ -7732,7 +7767,9 @@ class GPUModelRunner(
         self.initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
 
         # Reinitialize need to after initialize_attn_backend
-        self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
+        self.may_reinitialize_input_batch(
+            kv_cache_config, kernel_block_sizes, is_profiling=is_profiling
+        )
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )

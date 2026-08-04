@@ -27,12 +27,14 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
+    KVCacheSpecKind,
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    get_kv_cache_spec_kind,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
@@ -623,6 +625,30 @@ def hash_block_tokens(
     )
 
 
+def is_dcp_exempt_spec(kv_cache_spec: KVCacheSpec) -> bool:
+    """Whether a KV cache group is REPLICATED instead of DCP-sharded.
+
+    VLLM_SM86_DCP (DeepseekV4-sparse hybrid DCP): the sliding-window groups
+    (SWA KV + the fp32 compressor-state SlidingWindowMLASpec groups) keep a
+    full copy of their tokens on every DCP rank rather than round-robin
+    sharding them, so one logical block of such a group covers ``block_size``
+    tokens, not ``block_size * dcp_world_size``.
+
+    This is the single predicate behind that choice; every place that has to
+    agree on it (the manager's real block size, the scheduler-side group block
+    sizes in `resolve_kv_cache_block_sizes`) calls this function, so they
+    cannot drift apart. It is kind-based rather than isinstance-based to stay
+    robust when a caller hands over a UniformTypeKVCacheSpecs-wrapped spec
+    (the worker side already does; `get_kv_cache_spec_kind` recurses the
+    wrapper). Returns False unless VLLM_SM86_DCP is set, so non-DSV4 models
+    keep upstream behavior.
+    """
+    return envs.VLLM_SM86_DCP and get_kv_cache_spec_kind(kv_cache_spec) in (
+        KVCacheSpecKind.SLIDING_WINDOW,
+        KVCacheSpecKind.SLIDING_WINDOW_MLA,
+    )
+
+
 def resolve_kv_cache_block_sizes(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
@@ -633,7 +659,8 @@ def resolve_kv_cache_block_sizes(
       scheduler (e.g. for ``num_computed_tokens`` rounding). Single group:
       ``cache_config.block_size * dcp``. Multiple groups: LCM of every
       group's effective block size. Attention groups are scaled by DCP;
-      Mamba groups keep their full per-rank state and are not scaled.
+      Mamba groups and `is_dcp_exempt_spec` groups keep their full per-rank
+      state and are not scaled.
     - ``hash_block_size`` is the granularity at which ``Request.block_hashes``
       is computed. Single group: equals scheduler block size. Multiple groups:
       ``cache_config.prefix_match_unit`` override if set, else the GCD of
@@ -653,6 +680,7 @@ def resolve_kv_cache_block_sizes(
     group_block_sizes = [
         g.kv_cache_spec.block_size * dcp
         if isinstance(g.kv_cache_spec, AttentionSpec)
+        and not is_dcp_exempt_spec(g.kv_cache_spec)
         else g.kv_cache_spec.block_size
         for g in groups
     ]
@@ -662,9 +690,21 @@ def resolve_kv_cache_block_sizes(
     # invariant is LCM of the group block sizes scaled by dcp, KEEPING the
     # hybrid groups (and their 4x/128x compression) intact, unlike
     # --disable-hybrid-kv-cache-manager which unifies to the max page size
-    # and destroys the compression. dcp_exempt (replicated) sliding-window
-    # groups do not need the dcp scale, but the coarser LCM is a safe
-    # superset alignment, so no gating is required here.
+    # and destroys the compression.
+    #
+    # dcp_exempt (replicated) groups are gated out of the `* dcp` above, and
+    # the gate is load-bearing for `hash_block_size` even though it is inert
+    # for `scheduler_block_size`. The two aggregations move in opposite
+    # directions: scaling a group can only COARSEN the LCM, which stays a
+    # legal (superset) alignment, but it also coarsens the GCD below, and a
+    # coarser GCD is NOT legal -- the coordinator requires every manager's
+    # real block size to be divisible by `hash_block_size`, and an exempt
+    # manager's block size is the UNSCALED one (see `is_dcp_exempt_spec` and
+    # SingleTypeKVCacheManager.__init__). For DSV4 at dcp=4 the exempt sizes
+    # are 64/8/4 against a sharded 256*4=1024: the LCM is 1024 either way
+    # (1024 is already a multiple of all three, so nothing outside the hash
+    # path moves), while the GCD is 4 gated and 16 ungated -- and 4 % 16 != 0
+    # would fail that divisibility assert at engine init.
     scheduler_block_size = math.lcm(*group_block_sizes)
 
     # Block hashes are only consumed by prefix caching and KV connectors

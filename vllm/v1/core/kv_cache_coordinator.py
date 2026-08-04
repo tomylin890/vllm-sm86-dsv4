@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
 
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
+    is_dcp_exempt_spec,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -25,6 +28,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 def _validate_prefix_cache_retention_interval(
@@ -572,11 +577,31 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             # DCP shards full-attention KV across ranks and replicates Mamba
             # state; other spec types (e.g. sliding window) have no DCP-aware
             # handling yet, so reject them explicitly.
+            # VLLM_SM86_DCP (DeepseekV4-sparse hybrid DCP): sliding-window
+            # groups (SWA KV + the fp32 compressor-state SlidingWindowMLASpec
+            # groups) DO have DCP-aware handling on this path -- they are
+            # dcp_exempt, i.e. REPLICATED on every DCP rank instead of
+            # round-robin sharded (single_type_kv_cache_manager.py __init__ and
+            # SlidingWindowSpec.max_num_blocks_per_req) -- so their cached
+            # blocks are full copies with no shard view, and
+            # `find_longest_cache_hit` below already hands every
+            # non-FullAttentionSpec finder dcp_world_size=1, which is exactly
+            # the right view for a replicated group. The whitelist IS
+            # `is_dcp_exempt_spec` rather than a copy of its condition: a spec
+            # admitted here that its manager does NOT treat as dcp_exempt would
+            # be sharded while this coordinator reuses its blocks as replicated
+            # full copies -- silent cross-rank corruption instead of a crash --
+            # and an inlined copy guarded by a defensive assert could only ever
+            # be tautological. It is kind-based, so a UniformTypeKVCacheSpecs
+            # wrapper is unwrapped, matching the manager ctor's gate.
             for g in kv_cache_config.kv_cache_groups:
-                assert isinstance(g.kv_cache_spec, (FullAttentionSpec, MambaSpec)), (
+                spec = g.kv_cache_spec
+                if is_dcp_exempt_spec(spec):
+                    continue
+                assert isinstance(spec, (FullAttentionSpec, MambaSpec)), (
                     "DCP with hybrid KV cache layouts only supports "
                     "full-attention and Mamba groups, got: "
-                    f"{type(g.kv_cache_spec).__name__}."
+                    f"{type(spec).__name__}."
                 )
         # Partial hash hits are limited to full-attention + mamba ("align")
         # without context parallelism.
@@ -724,6 +749,24 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # per candidate length (see issue #32802).
         eagle_verified: set[int] = set()
 
+        # The reconciliation below is a monotone MIN fixed point, so a single
+        # group whose blocks have been evicted (sparse-retention groups free
+        # their tails mid-request and are the first eviction candidates) drags
+        # the whole request's hit down, possibly to 0 -- indistinguishable from
+        # a plain cache miss unless we record who shrank it. Debug-gated: this
+        # runs on every admission and the loop can iterate.
+        log_reconciliation = logger.isEnabledFor(logging.DEBUG)
+        shrunk_by: list[tuple[str, list[int], int, int]] = []
+        # Each group's length the FIRST time it was consulted. Not the same as
+        # `hit_length_by_group`, which the fixed point overwrites: it re-runs
+        # every non-full-attention finder at the reduced candidate, so once one
+        # group reports 0 they all read 0 and the column says nothing. Note a
+        # group first consulted AFTER another shrank the candidate is capped by
+        # it and reports the reduced value; `shrunk by` below is what names the
+        # group that actually did the shrinking. Asking every group at the full
+        # requested length instead would cost an extra pass on every admission.
+        first_hit_length_by_group: dict[int, int] = {}
+
         while True:
             curr_hit_length = hit_length
 
@@ -771,6 +814,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     kv_cache_spec=spec,
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=self._cache_hit_alignment_tokens,
+                    # Only full attention is DCP-sharded, so only its hashes
+                    # need the sharded block-size view. Every other spec type
+                    # is either rejected by the dcp>1 gate in __init__ or
+                    # dcp_exempt (replicated on every rank), and a replicated
+                    # group's blocks are full copies -- hence dcp_world_size=1.
                     dcp_world_size=(
                         self.dcp_world_size
                         if isinstance(spec, FullAttentionSpec)
@@ -782,10 +830,21 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 elif _new_hit_length < curr_hit_length:
                     # length shrunk; invalidate previous eagle verifications
                     eagle_verified.clear()
+                if log_reconciliation and _new_hit_length < curr_hit_length:
+                    shrunk_by.append(
+                        (
+                            type(spec).__name__,
+                            group_ids,
+                            curr_hit_length,
+                            _new_hit_length,
+                        )
+                    )
                 curr_hit_length = _new_hit_length
                 for group_id, blocks in zip(group_ids, hit_blocks):
                     hit_blocks_by_group[group_id] = blocks
                     hit_length_by_group[group_id] = _new_hit_length
+                    if log_reconciliation:
+                        first_hit_length_by_group.setdefault(group_id, _new_hit_length)
 
                 longest_hit_length = max(longest_hit_length, curr_hit_length)
 
@@ -794,6 +853,28 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             hit_length = curr_hit_length
             if is_simple_hybrid:
                 break
+
+        if log_reconciliation:
+            # First-sighting lengths, not `hit_length_by_group`: both the fixed
+            # point above and the truncation below overwrite the latter.
+            logger.debug(
+                "Cache hit reconciliation: reconciled=%d, requested=%d, "
+                "longest per-group=%d, per group at first sighting "
+                "(spec, group_ids, hit_length)=%s, shrunk by "
+                "(spec, group_ids, from, to)=%s",
+                hit_length,
+                max_cache_hit_length,
+                longest_hit_length,
+                [
+                    (
+                        type(group.spec).__name__,
+                        group.group_ids,
+                        first_hit_length_by_group.get(group.group_ids[0], 0),
+                    )
+                    for group in self.attention_groups
+                ],
+                shrunk_by,
+            )
 
         # Truncate full attention blocks to final hit_length (if present)
         first_group = self.attention_groups[0]

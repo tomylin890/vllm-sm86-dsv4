@@ -344,10 +344,15 @@ def _dsv4_runner_kwargs(dcp_size: int) -> dict:
         # DSV4_INTERLEAVE is still used for passkey POSITIONS above, which
         # is orthogonal to the runner's interleave setting).
         "cp_kv_cache_interleave_size": 1,
-        # Prefix caching must stay off under VLLM_SM86_DCP + dcp>1: the
-        # HybridKVCacheCoordinator dcp spec-type assert and the
-        # SlidingWindowManager cache-hit dcp==1 assert are only reachable
-        # with caching on (DCP-PLAN Workstream E owns caching under CP).
+        # PROFILE-P8 leg (prefix caching off). Before P11 this was mandatory
+        # under VLLM_SM86_DCP + dcp>1 because of the HybridKVCacheCoordinator
+        # spec-type assert ("DCP with hybrid KV cache layouts only supports
+        # full-attention and Mamba groups"), which P11 relaxes behind the
+        # gate; PROFILE-CACHE (caching on) is a separate leg. The
+        # SlidingWindowManager cache-hit dcp==1 assert this comment used to
+        # name alongside it is unreachable from the hybrid path --
+        # find_longest_cache_hit hands dcp_world_size=1 to every
+        # non-FullAttentionSpec finder (see PORT-NOTES.md H9(b)).
         "enable_prefix_caching": False,
         "enable_expert_parallel": True,
         "moe_backend": "deep_gemm_mega_moe",
