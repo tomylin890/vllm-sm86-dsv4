@@ -515,7 +515,7 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
             if row < len(prefill_req_ids):
                 prefix_tokens = seq_len - int(query_lens_cpu[row])
                 state = delta_tracker.plan_request(
-                    prefill_req_ids[row], prefix_tokens, new_entries
+                    prefill_req_ids[row], prefix_tokens, new_entries, seq_len
                 )
             if state is None:
                 fallback_rows.append(i)

@@ -107,8 +107,14 @@ def _select_deterministic(
     if num_rows == 0 or num_cols == 0 or topk_tokens == 0:
         return
 
-    neg_inf = torch.tensor(_NEG_INF, dtype=torch.float32, device=scores.device)
-    keys = torch.where(band_mask, scores.to(torch.float32), neg_inf)
+    # masked_fill with a PYTHON scalar, not torch.where against a tensor
+    # built from one: `torch.tensor(..., device=cuda)` is a host-to-device
+    # copy, which CUDA graph capture rejects outright ("Cannot copy between
+    # CPU and CUDA tensors during CUDA graph capture"). This gate predates
+    # FULL_DECODE_ONLY capture on this fork, so the copy went unnoticed until
+    # the gate was used with graphs on. Semantics are unchanged: out-of-band
+    # columns are set to -inf either way.
+    keys = scores.to(torch.float32).masked_fill(~band_mask, _NEG_INF)
     # Pass 1: score descending; `stable=True` keeps equal scores in ascending
     # column order, which IS the "lower index wins" tie-break.
     order = torch.argsort(keys, dim=-1, descending=True, stable=True)

@@ -29,7 +29,6 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
-    FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -45,6 +44,7 @@ logger = init_logger(__name__)
 def _zero_kv_blocks_kernel(
     seg_addrs_ptr,
     seg_page_sizes_ptr,
+    seg_block_strides_ptr,
     block_ids_ptr,
     n_blocks,
     N_SEGS: tl.constexpr,
@@ -58,10 +58,20 @@ def _zero_kv_blocks_kernel(
     buffer.  For backends where K/V is outermost (block_dim=1) there are
     two segments per buffer (one for K, one for V).
 
-    Segments may have different page sizes (e.g. models with multiple KV
-    cache groups like MLA + DSA indexer).  Each segment's page size is
-    read from seg_page_sizes_ptr; programs whose chunk_index falls beyond
-    their segment's page size early-exit.
+    A segment carries TWO sizes, which coincide only when the layer owns a
+    dense ``[num_blocks, page]`` allocation of its own:
+
+    * ``seg_block_strides_ptr`` -- the STEP between consecutive block ids;
+    * ``seg_page_sizes_ptr`` -- the PAYLOAD this segment owns inside one
+      block, i.e. how much is actually zeroed.
+
+    They differ under the packed DeepseekV4 layout, where every group's
+    every layer is a strided view into one shared block slab and the step is
+    the whole slab block stride.  Zeroing ``step`` bytes there would run off
+    the end of the layer's own page and into the next block id -- a block
+    that is live for another request -- so the payload must be read from its
+    own table.  Programs whose chunk_index falls beyond their segment's
+    payload early-exit.
 
     seg_addrs_ptr holds absolute byte addresses (int64) for each segment,
     allowing segments to live in different CUDA allocations.
@@ -79,11 +89,12 @@ def _zero_kv_blocks_kernel(
     page_size_el = tl.load(seg_page_sizes_ptr + seg_index)
     if chunk_index >= page_size_el // BLOCK_SIZE:
         return
+    block_stride_el = tl.load(seg_block_strides_ptr + seg_index)
     block_id = tl.load(block_ids_ptr + block_index)
     seg_addr = tl.load(seg_addrs_ptr + seg_index)
     ptr = tl.cast(seg_addr, tl.pointer_type(tl.int32))
     offset = (
-        block_id.to(tl.int64) * page_size_el.to(tl.int64)
+        block_id.to(tl.int64) * block_stride_el.to(tl.int64)
         + chunk_index.to(tl.int64) * BLOCK_SIZE
     )
     cols = tl.arange(0, BLOCK_SIZE).to(tl.int64)
@@ -120,17 +131,27 @@ class KVBlockZeroer:
         Only AttentionSpec layers are processed; Mamba layers are skipped.
         """
         self.device = device
-        self._meta: tuple[torch.Tensor, torch.Tensor, int, int, int] | None = None
+        self._meta: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None
+        ) = None
 
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
         seen_ptrs: set[int] = set()
         seg_addrs: list[int] = []
         seg_page_sizes: list[int] = []
+        seg_block_strides: list[int] = []
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
-            if not isinstance(spec, FullAttentionSpec):
+            # Every attention-family group is zeroed, matching the scheduler
+            # side (`SingleTypeKVCacheManager._record_new_block_ids`). Gating
+            # on FullAttentionSpec left the sliding-window families (the SWA KV
+            # window and the DeepseekV4 fp32 compressor state) without a
+            # segment of their own, so a block whose own group is not
+            # full-attention was only covered where another group's tensor
+            # happens to alias the same bytes. Mamba groups are still skipped.
+            if not isinstance(spec, AttentionSpec):
                 continue
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue
@@ -156,9 +177,14 @@ class KVBlockZeroer:
 
                 el = kv.element_size()
                 cur_bytes = kv.stride(block_dim) * el
-                assert cur_bytes % 4 == 0
-                kernel_block_el = cur_bytes // 4
-                cur_page_el = kernel_block_el * ratio
+                # The STEP between consecutive block ids. Deriving it from
+                # stride() is what makes the packed DeepseekV4 layout address
+                # correctly: there every layer of every group is a strided
+                # view into one shared block slab
+                # (`_reshape_attention_kv_cache`'s packing branch slices
+                # `view(-1, block_stride)[:, offset:offset + page_bytes]`),
+                # so stride(block_dim) is the slab's block stride.
+                cur_stride_bytes = cur_bytes * ratio
 
                 block_stride_bytes = cur_bytes
                 outer_dims = [
@@ -167,10 +193,48 @@ class KVBlockZeroer:
                     if kv.stride(d) * el > block_stride_bytes
                 ]
                 outer_strides = [kv.stride(d) * el for d in outer_dims]
+
+                # The PAYLOAD one segment owns inside one block: the span of
+                # every dim that is neither the block dim nor split out into
+                # its own segment. (A dim outside the block dim whose stride
+                # is SMALLER than the block step -- the K/V-first storage that
+                # `_update_hybrid_attention_mamba_layout` restrides -- lives
+                # INSIDE the block's extent and must be counted here, which is
+                # why this is a stride span and not a product of the trailing
+                # shapes.)
+                #
+                # Equal to the step for any layer that owns a dense
+                # [num_blocks, page] allocation, but a small fraction of it
+                # under the packed DeepseekV4 layout, where the step is the
+                # whole slab block stride. Using the step as the payload there
+                # writes `packed offset` bytes into block_id + 1 -- a block
+                # that is live for another request -- and past the end of the
+                # backing allocation on the last block.
+                inner_dims = [
+                    d
+                    for d in range(kv.dim())
+                    if d != block_dim and d not in outer_dims
+                ]
+                span_el = 1 + sum((kv.shape[d] - 1) * kv.stride(d) for d in inner_dims)
+                cur_page_bytes = span_el * el * ratio
+                assert cur_stride_bytes % 4 == 0
+                assert cur_page_bytes % 4 == 0
+                # A zero payload would make `largest_power_of_2_divisor` 0 and
+                # the chunk math below a ZeroDivisionError; a payload larger
+                # than the step would zero into the next block id. Fail loudly
+                # at init rather than corrupt memory at runtime.
+                assert 0 < cur_page_bytes <= cur_stride_bytes, (
+                    f"{layer_name}: payload {cur_page_bytes}B does not fit the "
+                    f"{cur_stride_bytes}B block step (ratio={ratio})"
+                )
+                cur_page_el = cur_page_bytes // 4
+                cur_block_stride_el = cur_stride_bytes // 4
+
                 for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
                     off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
                     seg_addrs.append(dp + off_bytes)
                     seg_page_sizes.append(cur_page_el)
+                    seg_block_strides.append(cur_block_stride_el)
 
         if not seg_addrs:
             self._meta = None
@@ -184,6 +248,7 @@ class KVBlockZeroer:
         self._meta = (
             torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
             torch.tensor(seg_page_sizes, dtype=torch.int64, device=self.device),
+            torch.tensor(seg_block_strides, dtype=torch.int64, device=self.device),
             max_page_size_el // blk_size,
             blk_size,
             len(seg_addrs),
@@ -193,13 +258,21 @@ class KVBlockZeroer:
         """Zero the KV cache memory for the given block IDs."""
         if not block_ids or self._meta is None:
             return
-        seg_addrs, seg_page_sizes, max_chunks, blk_size, n_segs = self._meta
+        (
+            seg_addrs,
+            seg_page_sizes,
+            seg_block_strides,
+            max_chunks,
+            blk_size,
+            n_segs,
+        ) = self._meta
         n_blocks = len(block_ids)
         idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
         grid = (n_blocks * n_segs * max_chunks,)
         _zero_kv_blocks_kernel[grid](
             seg_addrs,
             seg_page_sizes,
+            seg_block_strides,
             idx,
             n_blocks,
             N_SEGS=n_segs,

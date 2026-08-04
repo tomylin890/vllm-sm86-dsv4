@@ -37,7 +37,12 @@ Budget (``VLLM_DSV4_DELTA_GATHER_BUDGET_MB``): one per-worker byte budget
 across all tracked (request, layer) pairs. Admission and growth both charge
 it; when a charge fails, that (request, layer) is dropped to a BLOCKED
 sentinel and the request falls back to the existing full re-gather path on
-that layer (graceful, per request per layer). Every decision is a pure
+that layer (graceful, per request per layer). The sentinel outlives further
+chunks of its own request -- re-admitting one that never left would thrash
+the budget -- but never the request itself: the first sighting that is not a
+continuation drops it, so a later request reusing the id is planned on its
+own merits (GC alone cannot do this, since a request occupies a prefill row
+on every one of its own steps). Every decision is a pure
 function of rank-invariant host state (CPU seq lens, batch order, layer
 visit order, the env budget), so all ranks of a DCP group make identical
 decisions and the delta collectives stay symmetric.
@@ -97,6 +102,13 @@ class _ReqDeltaState:
     ``staging is None`` marks the BLOCKED sentinel: the budget rejected this
     (request, layer); it stays on the full re-gather path until GC removes
     it (re-admission while continuously present would thrash the budget).
+    A sentinel has no staging to chain, but it keeps the SAME continuity
+    record a tracked row keeps: ``upto`` is the last sighting's
+    ``new_entries`` and ``expected_prefix`` is the last sighting's seq len,
+    written by :meth:`_block` where :meth:`advance` would have written it.
+    That is what lets :meth:`plan_request` tell a further chunk of the
+    blocked request from a different request that reused its id -- including
+    one whose first sighting carries a large prefix-cache hit.
     """
 
     staging: torch.Tensor | None  # [capacity, 584] uint8, GLOBAL entry order
@@ -135,6 +147,29 @@ class Sm86DcpDeltaTracker:
     _absence: "dict[str, int]" = {}
     _GRACE = 3
 
+    # Requests that have already taken their one allocator flush, plus the
+    # consecutive-absence counter that retires those latches.
+    #
+    # Keyed per REQUEST, deliberately NOT as a set difference against the
+    # previous step's prefill rows: a co-scheduled prefill can be given zero
+    # tokens for a step and then does not appear in ``req_ids`` at all
+    # ("possible at 3+ concurrent prefills under
+    # long_prefill_token_threshold" -- `ampere_sparse._maybe_delta_tracker`),
+    # so an edge trigger re-fires for it on the way back in. That is an
+    # unbounded number of device-synchronising flushes per request, landing
+    # mid-prefill -- the exact placement this whole change exists to remove.
+    # A latch fires once per request id and is immune to the gap.
+    #
+    # Retirement reuses _GRACE for the same reason the staging GC does: one
+    # absent step proves nothing. It must also survive an EMPTY id set --
+    # gc_all IS reached on dummy/warmup/capture builds (gpu_model_runner
+    # populates `cm_req_ids` whenever VLLM_SM86_DCP and
+    # VLLM_DSV4_DELTA_GATHER are on, with no `for_cudagraph_capture` gate),
+    # and clearing the latches there would re-fire the flush for every
+    # request still mid-prefill.
+    _flushed: "set[str]" = set()
+    _flush_absence: "dict[str, int]" = {}
+
     @classmethod
     def gc_all(
         cls,
@@ -155,9 +190,25 @@ class Sm86DcpDeltaTracker:
           after _GRACE consecutive absences. Runs on decode-only steps
           too, fixing the budget leak where dead stagings survived until
           the next step that happened to carry a prefill row.
+
+        Also flushes the caching allocator once per request, on the step
+        that request enters prefill (see the empty_cache() call below).
         """
         live = set(live_req_ids)
         prefilling = set(prefill_req_ids)
+        entering = prefilling - cls._flushed
+        cls._flushed |= prefilling
+        for req_id in list(cls._flush_absence):
+            if req_id in live or req_id not in cls._flushed:
+                cls._flush_absence.pop(req_id, None)
+        for req_id in list(cls._flushed):
+            if req_id in live:
+                continue
+            n = cls._flush_absence.get(req_id, 0) + 1
+            cls._flush_absence[req_id] = n
+            if n >= cls._GRACE:
+                cls._flushed.discard(req_id)
+                cls._flush_absence.pop(req_id, None)
         tracked: set[str] = set()
         for tracker in cls._instances:
             tracked.update(tracker._states)
@@ -175,27 +226,59 @@ class Sm86DcpDeltaTracker:
             cls._absence[req_id] = n
             if n >= cls._GRACE:
                 doomed.append(req_id)
-        freed_any = False
         for tracker in cls._instances:
-            before = len(tracker._states)
             for req_id in doomed:
                 if req_id in tracker._states:
                     tracker._free(req_id)
-            freed_any = freed_any or len(tracker._states) < before
         for req_id in doomed:
             cls._absence.pop(req_id, None)
-        if freed_any:
-            # Request boundary: hundreds of MiB of staging plus a long
-            # prefill's transients were just freed, but the caching
-            # allocator pins freed blocks to the stream that used them
-            # (DSV4 runs dual streams via maybe_execute_in_parallel) and
-            # graph pools are separate, so the NEXT long request's first
-            # allocations can OOM with gigabytes 'reserved but
-            # unallocated' (observed: 16 MiB requests failing on the 2nd
-            # consecutive 200k prompt). empty_cache() syncs the free
-            # events and returns the blocks to CUDA. Runs once per
-            # request transition on the eager prefill path -- never under
-            # capture -- and is a local op on every rank (no collective).
+        if entering:
+            # Request boundary. By now hundreds of MiB of a previous
+            # request's staging plus a long prefill's transients have been
+            # freed, but the caching allocator pins freed blocks to the
+            # stream that used them (DSV4 runs dual streams via
+            # maybe_execute_in_parallel) and graph pools are separate, so
+            # the entering request's first allocations can OOM with
+            # gigabytes 'reserved but unallocated' (observed: 16 MiB
+            # requests failing on the 2nd consecutive 200k prompt).
+            # empty_cache() syncs the free events and returns the blocks to
+            # CUDA, here right before that request's first layer allocates
+            # anything (gc_all runs from the metadata builder, ahead of
+            # every layer's forward).
+            #
+            # Keyed on the ENTERING request and not on a free having
+            # happened: a free is a function of the PREVIOUS request's
+            # lifecycle -- with _GRACE it lands around the third step of
+            # the next request's prefill -- and flushing returns every
+            # cached block to CUDA, which moves the address and the
+            # residual bytes of every torch.empty later in that step. Keyed
+            # that way the second of two identical consecutive requests
+            # takes the flush mid-prefill and the first, having no
+            # predecessor, never takes it at all. Every request now takes
+            # exactly one flush -- `_flushed` is a per-request latch, not a
+            # prefill-set edge, so a prefill that is skipped for a step and
+            # comes back does not pay a second one.
+            #
+            # Never runs inside a captured region: capture wraps only the
+            # model forward (`with torch.cuda.graph(...)` in
+            # compilation/cuda_graph.py) and gc_all runs from the metadata
+            # builder, which completes before that wrapper is entered. It IS
+            # reached on dummy/warmup/capture BUILDS, so it must stay
+            # tolerant of an empty or stale id set -- hence the graced
+            # retirement above and not a plain intersection. Note
+            # cuda_graph.py neutralises only `torch.accelerator.empty_cache`
+            # during capture, not this call, so there is no safety net if it
+            # ever migrates inside.
+            #
+            # The DECISION is rank-symmetric (`prefill_req_ids` is a slice of
+            # the broadcast scheduler output and `_flushed` is advanced by
+            # the same call sequence on every rank), so no collective is
+            # skewed. The LATENCY is not: each rank's flush costs what its
+            # own fragmentation costs, and the group pays max-over-ranks at
+            # the next delta all-gather. That is the argument for keeping the
+            # count at one per request rather than for gating on per-rank
+            # allocator state, which would make the decision itself
+            # rank-dependent.
             torch.cuda.empty_cache()
 
     def gc(self, live_prefill_req_ids: "list[str]") -> None:
@@ -210,13 +293,24 @@ class Sm86DcpDeltaTracker:
         if state.staging is not None:
             self._budget.release(state.capacity * _SM86_DCP_ENTRY_BYTES)
 
-    def _block(self, req_id: str) -> None:
+    def _block(self, req_id: str, new_entries: int, seq_len_tokens: int) -> None:
+        # Same continuity contract `advance()` records for a tracked row: the
+        # next sighting of THIS request must present prefix_tokens equal to
+        # this sighting's seq len. A blocked row never reaches advance(), so
+        # plan_request records it here instead.
         self._states[req_id] = _ReqDeltaState(
-            staging=None, capacity=0, upto=0, expected_prefix=-1
+            staging=None,
+            capacity=0,
+            upto=new_entries,
+            expected_prefix=seq_len_tokens,
         )
 
     def plan_request(
-        self, req_id: str, prefix_tokens: int, new_entries: int
+        self,
+        req_id: str,
+        prefix_tokens: int,
+        new_entries: int,
+        seq_len_tokens: int,
     ) -> "_ReqDeltaState | None":
         """Admit/continue tracking; None means take the full re-gather path.
 
@@ -224,11 +318,37 @@ class Sm86DcpDeltaTracker:
         new_entries)`` into ``state.staging`` and (b) call :meth:`advance`
         -- even when the delta is empty, so the continuity chain stays
         unbroken.
+
+        ``seq_len_tokens`` is this sighting's seq len, i.e. what the next
+        sighting of this request will present as ``prefix_tokens``. It is
+        what :meth:`advance` records for an admitted row; it is passed in
+        here because a BLOCKED row never reaches advance() and still needs
+        the same continuity record to tell its own next chunk from a
+        different request that reused its id.
         """
         state = self._states.get(req_id)
         if state is not None and state.staging is None:
-            return None  # blocked by the budget; stays blocked until GC
-        if state is not None and (
+            # BLOCKED sentinel. It must outlive re-asking by the SAME
+            # request (re-admitting one that is continuously present would
+            # thrash the budget) but it must NOT outlive the request: gc_all
+            # never sees a blocked id absent while its request keeps
+            # occupying a prefill row, so without a freshness check here a
+            # later request that reuses the id inherits the block for its
+            # whole life. `_block()` records the same next-expected seq len
+            # `advance()` records for a tracked row, so the freshness test is
+            # the tracked path's EQUALITY test, not a monotonicity test: with
+            # prefix caching on (P11) a fresh admission's first sighting
+            # presents prefix_tokens = H for a cache hit at H tokens, which
+            # is routinely larger than a dead predecessor's last prefix. Any
+            # `>=` rule keeps the sentinel exactly in the case this reorder
+            # exists to fix.
+            if prefix_tokens == state.expected_prefix and new_entries >= state.upto:
+                state.expected_prefix = seq_len_tokens
+                state.upto = new_entries
+                return None  # still the same request: stays blocked
+            self._free(req_id)
+            state = None
+        elif state is not None and (
             prefix_tokens != state.expected_prefix or new_entries < state.upto
         ):
             # Discontinuity: preempt-resume with different chunking, or a
@@ -242,7 +362,7 @@ class Sm86DcpDeltaTracker:
                 return None  # nothing to stage yet; admit at a later chunk
             capacity = _initial_capacity(new_entries)
             if not self._budget.try_charge(capacity * _SM86_DCP_ENTRY_BYTES):
-                self._block(req_id)
+                self._block(req_id, new_entries, seq_len_tokens)
                 return None
             state = _ReqDeltaState(
                 staging=torch.empty(
@@ -262,7 +382,7 @@ class Sm86DcpDeltaTracker:
             grow_bytes = (new_capacity - state.capacity) * _SM86_DCP_ENTRY_BYTES
             if not self._budget.try_charge(grow_bytes):
                 self._free(req_id)
-                self._block(req_id)
+                self._block(req_id, new_entries, seq_len_tokens)
                 return None
             assert state.staging is not None
             new_staging = torch.empty(

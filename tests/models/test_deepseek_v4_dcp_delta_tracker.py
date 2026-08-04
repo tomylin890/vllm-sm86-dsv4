@@ -72,7 +72,33 @@ def isolated_budget(monkeypatch):
     monkeypatch.setattr(dcp_delta_tracker, "_BUDGET", None)
     monkeypatch.setattr(Sm86DcpDeltaTracker, "_instances", [])
     monkeypatch.setattr(Sm86DcpDeltaTracker, "_absence", {})
+    monkeypatch.setattr(Sm86DcpDeltaTracker, "_flushed", set())
+    monkeypatch.setattr(Sm86DcpDeltaTracker, "_flush_absence", {})
     return get_delta_gather_budget()
+
+
+@pytest.fixture
+def tiny_budget(monkeypatch):
+    """As `isolated_budget`, but 1 MiB: seven min-capacity stagings fit.
+
+    Small enough to reach the BLOCKED sentinel without building the 14
+    layers a 200k cache hit needs to exhaust the 512 MiB default.
+    """
+    monkeypatch.setenv("VLLM_DSV4_DELTA_GATHER_BUDGET_MB", "1")
+    monkeypatch.setattr(dcp_delta_tracker, "_BUDGET", None)
+    monkeypatch.setattr(Sm86DcpDeltaTracker, "_instances", [])
+    monkeypatch.setattr(Sm86DcpDeltaTracker, "_absence", {})
+    monkeypatch.setattr(Sm86DcpDeltaTracker, "_flushed", set())
+    monkeypatch.setattr(Sm86DcpDeltaTracker, "_flush_absence", {})
+    return get_delta_gather_budget()
+
+
+@pytest.fixture
+def empty_cache_calls(monkeypatch):
+    """Counts `torch.cuda.empty_cache()` calls (a no-op without CUDA)."""
+    calls: list[None] = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append(None))
+    return calls
 
 
 def test_plan_request_admits_fresh_admission_with_nonzero_prefix(isolated_budget):
@@ -81,7 +107,7 @@ def test_plan_request_admits_fresh_admission_with_nonzero_prefix(isolated_budget
     seq_len = _HIT_TOKENS + _CHUNK_TOKENS
     new_entries = _entries(seq_len)
 
-    state = tracker.plan_request("r1", _HIT_TOKENS, new_entries)
+    state = tracker.plan_request("r1", _HIT_TOKENS, new_entries, seq_len)
 
     # Admitted, not refused: nothing on this path may require prefix_tokens
     # to be 0 just because there is no history to be continuous with.
@@ -106,13 +132,15 @@ def test_plan_request_resumes_delta_chain_after_a_cache_hit_admission(
     seq_len = _HIT_TOKENS + _CHUNK_TOKENS
     new_entries = _entries(seq_len)
 
-    state = tracker.plan_request("r1", _HIT_TOKENS, new_entries)
+    state = tracker.plan_request("r1", _HIT_TOKENS, new_entries, seq_len)
     assert state is not None
     tracker.advance(state, new_entries, seq_len)
     charged_after_admission = isolated_budget.used_bytes
 
     next_seq_len = seq_len + _CHUNK_TOKENS
-    next_state = tracker.plan_request("r1", seq_len, _entries(next_seq_len))
+    next_state = tracker.plan_request(
+        "r1", seq_len, _entries(next_seq_len), next_seq_len
+    )
 
     assert next_state is state
     assert next_state.upto == new_entries
@@ -152,13 +180,280 @@ def test_delta_gather_budget_covers_a_fixed_number_of_layers_at_200k(
     admitted = [
         tracker
         for tracker in trackers
-        if tracker.plan_request("r1", _HIT_TOKENS, new_entries) is not None
+        if tracker.plan_request("r1", _HIT_TOKENS, new_entries, seq_len) is not None
     ]
 
     assert len(admitted) == expected_layers
     assert isolated_budget.used_bytes == expected_layers * per_layer_bytes
-    # The refused layers latch the BLOCKED sentinel: re-asking on the next
-    # chunk must not thrash the budget.
+    # The refused layers latch the BLOCKED sentinel: re-asking on the NEXT
+    # chunk (the only thing the caller ever does) must not thrash the budget.
+    next_seq_len = seq_len + _CHUNK_TOKENS
     for tracker in trackers[expected_layers:]:
-        assert tracker.plan_request("r1", _HIT_TOKENS, new_entries) is None
+        assert (
+            tracker.plan_request("r1", seq_len, _entries(next_seq_len), next_seq_len)
+            is None
+        )
     assert isolated_budget.used_bytes == expected_layers * per_layer_bytes
+
+
+# ---------------------------------------------------------------------------
+# Cross-request state leaks (pre-existing, found during P11 rack verification).
+# ---------------------------------------------------------------------------
+
+_PREFILL_STEPS = 4  # chunks per request in the step simulations below
+
+
+def _prefill_step(
+    tracker: Sm86DcpDeltaTracker, req_id: str, chunk: int
+) -> None:
+    """One scheduler step in which ``req_id`` is the only prefill row.
+
+    Mirrors the real call order: the metadata builder GCs across all layer
+    trackers BEFORE any layer runs (sparse_swa.py), then the layer plans and
+    advances its chunk.
+    """
+    Sm86DcpDeltaTracker.gc_all([req_id], [req_id])
+    prefix_tokens = chunk * _CHUNK_TOKENS
+    seq_len = prefix_tokens + _CHUNK_TOKENS
+    state = tracker.plan_request(req_id, prefix_tokens, _entries(seq_len), seq_len)
+    if state is not None:
+        tracker.advance(state, _entries(seq_len), seq_len)
+
+
+def _run_prefill(
+    tracker: Sm86DcpDeltaTracker, req_id: str, empty_cache_calls: "list[None]"
+) -> "list[int]":
+    """Drive a whole prefill; return the chunk indices that flushed."""
+    flushed_at: list[int] = []
+    for chunk in range(_PREFILL_STEPS):
+        before = len(empty_cache_calls)
+        _prefill_step(tracker, req_id, chunk)
+        if len(empty_cache_calls) > before:
+            flushed_at.append(chunk)
+    return flushed_at
+
+
+def test_empty_cache_is_symmetric_across_consecutive_identical_requests(
+    isolated_budget, empty_cache_calls
+):
+    """Two identical back-to-back requests must see the same allocator events.
+
+    `gc_all` runs from the metadata builder on every step, and the flush it
+    performs frees every cached block back to CUDA -- which moves the address
+    (and the residual bytes) of every `torch.empty` later in that same step.
+    Tying it to a free makes it land in the middle of the NEXT request's
+    prefill (`_GRACE` steps after its predecessor vanished), so the first
+    request of a fresh process never sees it and its identical successor
+    does.
+    """
+    tracker = Sm86DcpDeltaTracker(torch.device("cpu"))
+
+    first = _run_prefill(tracker, "r1", empty_cache_calls)
+    # "r1" finished inside its last prefill chunk (max_tokens=1 / abort), so
+    # it never appears as a decode row and only the grace path can free it.
+    second = _run_prefill(tracker, "r2", empty_cache_calls)
+
+    assert first == second, (
+        "empty_cache() landed on different steps of two identical requests: "
+        f"{first} vs {second}"
+    )
+    # ...and not by never running at all: the flush is load-bearing (it is
+    # what keeps the 2nd consecutive 200k prompt from OOMing).
+    assert first, "empty_cache() must still run once per request"
+
+
+def test_empty_cache_runs_at_a_request_boundary_before_any_allocation(
+    isolated_budget, empty_cache_calls
+):
+    """The flush belongs to the request entering prefill, not to a free.
+
+    `gc_all` is called by the builder before any layer's forward, so a flush
+    issued there for the entering request precedes every allocation that
+    request makes -- exactly where the recorded OOM ("16 MiB requests failing
+    on the 2nd consecutive 200k prompt") needs it, instead of some steps into
+    the prefill that has already started allocating.
+    """
+    tracker = Sm86DcpDeltaTracker(torch.device("cpu"))
+    _run_prefill(tracker, "r1", empty_cache_calls)
+
+    before = len(empty_cache_calls)
+    Sm86DcpDeltaTracker.gc_all(["r2"], ["r2"])  # r2's FIRST prefill step
+    assert len(empty_cache_calls) > before
+    # Nothing of r2 has been planned yet, so the flush cannot have moved any
+    # of r2's own buffers.
+    assert "r2" not in tracker._states
+
+    # A continuing chunk is not a boundary: no further flush.
+    before = len(empty_cache_calls)
+    state = tracker.plan_request("r2", 0, _entries(_CHUNK_TOKENS), _CHUNK_TOKENS)
+    assert state is not None
+    tracker.advance(state, _entries(_CHUNK_TOKENS), _CHUNK_TOKENS)
+    Sm86DcpDeltaTracker.gc_all(["r2"], ["r2"])
+    assert len(empty_cache_calls) == before
+
+
+def test_blocked_sentinel_is_dropped_when_a_new_request_reuses_the_id(
+    tiny_budget,
+):
+    """A budget-blocked (request, layer) must not outlive its request.
+
+    `gc_all` cannot clear the sentinel while the id is in the prefill rows,
+    and a request is in the prefill rows on every one of its own steps -- so
+    if the early return fires before the prefix-continuity reset, a later
+    request that reuses the id inherits the block for its entire life and
+    silently runs the full re-gather path its predecessor-less twin would
+    not.
+    """
+    first_entries = _entries(_CHUNK_TOKENS)
+    # A first chunk is far under the `_MIN_CAPACITY_ENTRIES` floor, so every
+    # admission charges the same 256 x 584 B whatever the chunk size.
+    per_hog_bytes = (
+        next_power_of_2(max(first_entries, dcp_delta_tracker._MIN_CAPACITY_ENTRIES))
+        * _SM86_DCP_ENTRY_BYTES
+    )
+    hog_layers = tiny_budget.limit_bytes // per_hog_bytes
+    assert hog_layers >= 1
+
+    hogs = [Sm86DcpDeltaTracker(torch.device("cpu")) for _ in range(hog_layers)]
+    for hog in hogs:
+        assert hog.plan_request("hog", 0, first_entries, _CHUNK_TOKENS) is not None
+
+    # This layer is refused and latches the BLOCKED sentinel on its first,
+    # cold chunk (prefix_tokens == 0).
+    tracker = Sm86DcpDeltaTracker(torch.device("cpu"))
+    assert tracker.plan_request("x", 0, first_entries, _CHUNK_TOKENS) is None
+
+    # The hogs finish; their staging is freed after the grace period, so the
+    # budget is wide open again. "x" is in the prefill rows throughout, so
+    # its sentinel is never a GC candidate.
+    for _ in range(Sm86DcpDeltaTracker._GRACE):
+        Sm86DcpDeltaTracker.gc_all(["x"], ["x"])
+    assert tiny_budget.used_bytes == 0
+
+    # Same request, next chunk: the sentinel must survive. Re-admitting a
+    # continuously present request would thrash the budget.
+    assert (
+        tracker.plan_request(
+            "x", _CHUNK_TOKENS, _entries(2 * _CHUNK_TOKENS), 2 * _CHUNK_TOKENS
+        )
+        is None
+    )
+    assert tiny_budget.used_bytes == 0
+
+    # A NEW request reuses the id and starts cold. This is a fresh admission
+    # -- no history for it to be continuous with -- and it must be planned on
+    # the budget's merits, not on its predecessor's.
+    state = tracker.plan_request("x", 0, first_entries, _CHUNK_TOKENS)
+    assert state is not None
+    assert state.staging is not None
+    assert state.upto == 0
+    assert state.expected_prefix == 0
+    assert tiny_budget.used_bytes == per_hog_bytes
+
+
+def test_empty_cache_fires_once_per_request_across_a_skipped_prefill_step(
+    isolated_budget, empty_cache_calls
+):
+    """A prefill that gets zero tokens for a step must not re-pay the flush.
+
+    `prefill_req_ids` is a slice of the step's `req_ids`, so a co-scheduled
+    prefill that is scheduled zero tokens is absent from the prefill rows
+    entirely and reappears on the next step -- documented in this fork at
+    `ampere_sparse._maybe_delta_tracker` ("possible at 3+ concurrent prefills
+    under long_prefill_token_threshold") and made likely by P10's adaptive
+    long-prefill threshold. A set-difference trigger charges that request a
+    second device-synchronising `empty_cache()` in the MIDDLE of its own
+    prefill, with its staging and indexer transients already allocated.
+    """
+    Sm86DcpDeltaTracker(torch.device("cpu"))
+
+    Sm86DcpDeltaTracker.gc_all(["a", "b"], ["a", "b"])
+    assert len(empty_cache_calls) == 1  # both entered on the same step
+
+    # "b" is given zero tokens this step: it keeps its blocks and its place in
+    # the batch, but it carries no prefill row.
+    Sm86DcpDeltaTracker.gc_all(["a", "b"], ["a"])
+    # ...and comes back on the next one.
+    Sm86DcpDeltaTracker.gc_all(["a", "b"], ["a", "b"])
+
+    assert len(empty_cache_calls) == 1, (
+        "a skipped prefill step re-fired the allocator flush mid-prefill"
+    )
+
+
+def test_empty_cache_latch_survives_a_dummy_build_with_no_requests(
+    isolated_budget, empty_cache_calls
+):
+    """`gc_all` is reached on dummy/warmup/capture builds with an empty set.
+
+    `gpu_model_runner` populates `cm_req_ids` whenever VLLM_SM86_DCP and
+    VLLM_DSV4_DELTA_GATHER are on, with no `for_cudagraph_capture` gate, so
+    an empty id set reaches gc_all. Clearing the latches there would re-fire
+    the flush for every request still mid-prefill.
+    """
+    Sm86DcpDeltaTracker(torch.device("cpu"))
+
+    Sm86DcpDeltaTracker.gc_all(["a"], ["a"])
+    assert len(empty_cache_calls) == 1
+
+    Sm86DcpDeltaTracker.gc_all([], [])  # dummy batch
+    Sm86DcpDeltaTracker.gc_all(["a"], ["a"])
+
+    assert len(empty_cache_calls) == 1
+
+
+def test_empty_cache_latch_is_retired_after_the_request_is_gone(
+    isolated_budget, empty_cache_calls
+):
+    """The latch set must not grow without bound over a server's lifetime."""
+    Sm86DcpDeltaTracker(torch.device("cpu"))
+
+    Sm86DcpDeltaTracker.gc_all(["a"], ["a"])
+    assert Sm86DcpDeltaTracker._flushed == {"a"}
+    for _ in range(Sm86DcpDeltaTracker._GRACE):
+        Sm86DcpDeltaTracker.gc_all(["b"], ["b"])
+    assert "a" not in Sm86DcpDeltaTracker._flushed
+
+
+def test_blocked_sentinel_is_dropped_when_the_reusing_request_hits_the_cache(
+    tiny_budget,
+):
+    """The reuse case P11 actually produces: a first sighting with a prefix.
+
+    With prefix caching on, a fresh admission presents ``prefix_tokens = H``
+    for a cache hit at H tokens -- routinely far larger than a dead
+    predecessor's last recorded prefix. A monotonicity test (``>=``) keeps the
+    stale sentinel in exactly this case; only the tracked path's equality
+    contract drops it.
+    """
+    first_entries = _entries(_CHUNK_TOKENS)
+    per_hog_bytes = (
+        next_power_of_2(max(first_entries, dcp_delta_tracker._MIN_CAPACITY_ENTRIES))
+        * _SM86_DCP_ENTRY_BYTES
+    )
+    hog_layers = tiny_budget.limit_bytes // per_hog_bytes
+    assert hog_layers >= 1
+
+    hogs = [Sm86DcpDeltaTracker(torch.device("cpu")) for _ in range(hog_layers)]
+    for hog in hogs:
+        assert hog.plan_request("hog", 0, first_entries, _CHUNK_TOKENS) is not None
+
+    tracker = Sm86DcpDeltaTracker(torch.device("cpu"))
+    assert tracker.plan_request("x", 0, first_entries, _CHUNK_TOKENS) is None
+
+    for _ in range(Sm86DcpDeltaTracker._GRACE):
+        Sm86DcpDeltaTracker.gc_all(["x"], ["x"])
+    assert tiny_budget.used_bytes == 0
+
+    # A NEW request reuses the id and its FIRST sighting carries a cache hit.
+    # The hit is kept small only so the 1 MiB test budget can admit it; what
+    # matters is that it is >= the dead sentinel's recorded prefix (512) and
+    # its entry count >= the sentinel's, i.e. every `>=` rule keeps the block.
+    hit_tokens = 4 * _CHUNK_TOKENS
+    hit_seq_len = hit_tokens + _CHUNK_TOKENS
+    assert hit_tokens >= _CHUNK_TOKENS  # the sentinel's recorded prefix
+    state = tracker.plan_request("x", hit_tokens, _entries(hit_seq_len), hit_seq_len)
+    assert state is not None, "stale BLOCKED sentinel survived a cache-hit reuse"
+    assert state.staging is not None
+    assert state.upto == 0
+    assert state.expected_prefix == hit_tokens

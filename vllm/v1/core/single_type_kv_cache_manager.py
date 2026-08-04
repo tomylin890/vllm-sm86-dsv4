@@ -17,6 +17,7 @@ from vllm.v1.core.kv_cache_utils import (
     resolve_block_hashes,
 )
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
     FullAttentionSpec,
@@ -99,11 +100,24 @@ class SingleTypeKVCacheManager(ABC):
         self._max_admission_blocks_per_request = max_admission_blocks_per_request
         # Record newly allocated block ids only when worker-side zeroing will
         # consume them and this manager holds a spec type that gets zeroed.
-        self._record_new_block_ids = needs_kv_cache_zeroing and type(kv_cache_spec) in (
-            FullAttentionSpec,
-            TQFullAttentionSpec,
-            MLAAttentionSpec,
-            HiddenStateCacheSpec,
+        # Every attention-family group qualifies: all groups draw from the one
+        # shared `BlockPool` the coordinator builds, and the packed DeepseekV4
+        # layout deliberately overlays the groups inside a single block slab
+        # ("A block ID is owned by one cache group at a time, so layouts from
+        # different groups may overlap" -- `_get_packed_kv_cache_layout`), so a
+        # block recycled out of one group carries its previous tenant's bytes
+        # into the next one -- e.g. uint8 fp8 MLA KV read as fp32 compressor
+        # state. The exact `type()` test this replaces silently excluded
+        # SlidingWindowSpec / SlidingWindowMLASpec (the SWA KV window and both
+        # fp32 compressor-state families) plus the FullAttentionSpec subclasses
+        # it did not enumerate. Non-attention (Mamba) groups keep their current
+        # behaviour; the worker-side zeroer skips them as well.
+        # A UniformTypeKVCacheSpecs wrapper cannot reach this ctor -- the
+        # scheduler config unwraps every group first
+        # (`generate_scheduler_kv_cache_config`) and the registry has no
+        # manager for the wrapper -- so no kind-based recursion is needed here.
+        self._record_new_block_ids = needs_kv_cache_zeroing and isinstance(
+            kv_cache_spec, AttentionSpec
         )
         self.new_block_ids: list[int] = []
 

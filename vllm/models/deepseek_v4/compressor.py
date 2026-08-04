@@ -264,10 +264,14 @@ def validate_compressor_lookback_coverage(
     p]`` at every boundary position ``p`` with ``(p + 1) % m == 0``
     (``fused_compress_quant_cache.py``), i.e. ``L = sliding_window`` rows, of
     which ``L - m`` fall BELOW the position the request resumes from. Those
-    rows are never recomputed by the resumed pass, and a freshly allocated
-    state block is not zeroed (SlidingWindowMLASpec is excluded from
-    ``_record_new_block_ids``), so reading them uninitialized is an Inf/NaN
-    hazard rather than a small drift. What makes the resume correct is not a
+    rows are never recomputed by the resumed pass, so reading them without
+    having written them is wrong however they were left. A freshly allocated
+    state block IS now zeroed -- ``_record_new_block_ids`` admits every
+    attention-family group, SlidingWindowMLASpec included
+    (``single_type_kv_cache_manager.py``) -- which downgrades the hazard from
+    another tenant's uint8 bytes read as fp32 (Inf/NaN) to a lookback of
+    zeros, but zeros are still a WRONG lookback, not a safe one, so this
+    check still guards the same thing. What makes the resume correct is not a
     trim but the SWA cache-hit geometry: ``SlidingWindowManager`` reserves
     ``_contiguous_blocks_for_hit`` REAL blocks ending at the hit boundary
     ``H`` for every sliding-window group, and ``H`` is a multiple of the
