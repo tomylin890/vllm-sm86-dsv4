@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -438,6 +439,22 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        # VLLM_LONG_PREFILL_THRESHOLD_ADAPTIVE: apply the long-prefill chunk
+        # cap only when 2+ prefill-phase requests are pending, so a solo
+        # request keeps full-budget chunks. Computed once per step from host
+        # state (rank-invariant: every rank derives scheduling from the same
+        # broadcast, and this runs on the scheduler only anyway).
+        self._apply_prefill_threshold = True
+        if (
+            envs.VLLM_LONG_PREFILL_THRESHOLD_ADAPTIVE
+            and self.scheduler_config.long_prefill_token_threshold > 0
+        ):
+            pending_prefills = len(self.waiting) + sum(
+                1
+                for r in self.running
+                if r.num_computed_tokens < r.num_prompt_tokens
+            )
+            self._apply_prefill_threshold = pending_prefills > 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -518,7 +535,12 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+            if (
+                self._apply_prefill_threshold
+                and 0
+                < self.scheduler_config.long_prefill_token_threshold
+                < num_new_tokens
+            ):
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
 
@@ -897,7 +919,7 @@ class Scheduler(SchedulerInterface):
                         pad_spec_decode = True
 
                     threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
+                    if self._apply_prefill_threshold and 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 
                     # chunked prefill has to be enabled explicitly to allow

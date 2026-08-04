@@ -132,6 +132,7 @@ if TYPE_CHECKING:
     VLLM_DSV4_SM86_INDEXER_TILES: bool = False
     VLLM_DSV4_DELTA_GATHER: bool = False
     VLLM_DSV4_DELTA_GATHER_BUDGET_MB: int = 512
+    VLLM_LONG_PREFILL_THRESHOLD_ADAPTIVE: bool = False
     VLLM_DSV4_COMPRESSOR_WINDOWED: bool = False
     VLLM_DSV4_COMPRESSOR_WINDOW: int = 512
     VLLM_USE_OINK_OPS: bool = False
@@ -1282,6 +1283,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # request per layer. 512 MiB fits one 131k-token request across all 41
     # compressed layers of a single-stage (TP8) worker with headroom; see
     # P7-NOTES.md for the budget table.
+    # When set, long_prefill_token_threshold caps a prefill chunk ONLY when
+    # more than one prefill-phase request is pending (running prefill or
+    # waiting): a solo request keeps full max_num_batched_tokens chunks
+    # (zero single-stream regression) while concurrent prefills split the
+    # budget and co-schedule. Off = upstream semantics (always cap).
+    "VLLM_LONG_PREFILL_THRESHOLD_ADAPTIVE": lambda: bool(
+        int(os.getenv("VLLM_LONG_PREFILL_THRESHOLD_ADAPTIVE", "0"))
+    ),
     "VLLM_DSV4_DELTA_GATHER_BUDGET_MB": lambda: int(
         os.getenv("VLLM_DSV4_DELTA_GATHER_BUDGET_MB", "512")
     ),
