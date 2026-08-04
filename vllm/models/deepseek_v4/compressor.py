@@ -213,7 +213,10 @@ def get_compressor_state_window(vllm_config: VllmConfig) -> int | None:
             "VLLM_DSV4_COMPRESSOR_WINDOWED to fall back to the "
             "prefix-cacheable absolute-position placement and keep prefix "
             "caching on; that reservation grows with max_num_batched_tokens, "
-            "so cap it at 512. The conflict is never resolved silently -- "
+            "so cap it at 768 (the measured ceiling at max_model_len "
+            "262144 on 24 GiB cards: 1024 needs 0.55 GiB for admission "
+            "against a 0.89 GiB pool that must also hold ~0.6 GiB of "
+            "prefill transients). The conflict is never resolved silently -- "
             "either resolution changes the KV footprint by gigabytes."
         )
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
