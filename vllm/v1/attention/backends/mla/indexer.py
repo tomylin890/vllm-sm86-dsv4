@@ -662,11 +662,34 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         world = self.dcp_world_size
         interleave = self.cp_kv_cache_interleave_size
 
+        # `num_tokens` is common_attn_metadata.num_actual_tokens, which on a
+        # FULL-cudagraph decode step is the PADDED token count
+        # (gpu_model_runner.py:2454 `num_actual_tokens=num_tokens_padded`,
+        # gated by :4334 `pad_attn = cudagraph_mode == CUDAGraphMode.FULL`),
+        # while `query_start_loc` only counts REAL tokens and then repeats its
+        # last value (gpu_model_runner.py:2084). Tokens >= query_start_loc[-1]
+        # therefore belong to no request, and searchsorted(right=True) maps
+        # them one row PAST the batch. The request-major Triton twin this
+        # replaces (compressor_utils.get_compressed_slot_mapping, grid
+        # `(num_reqs,)`) never visits a padded token; this token-major inverse
+        # must exclude them explicitly, or every gather below is an
+        # out-of-bounds `aten::index` (ATen IndexKernel.cu "index out of
+        # bounds"). num_tokens == 0 already returned above, so num_rows >= 1.
+        num_rows = query_start_loc.shape[0] - 1
         token_ids = self.arange_buffer[:num_tokens]
+        # Real-token mask. 0-d select + compare: device-side, no host sync.
+        in_batch = token_ids < query_start_loc[num_rows]
         # Token -> request id. query_start_loc is non-decreasing; right=True
         # lands after every boundary <= i, so empty (padded) requests are
-        # skipped correctly.
-        req_ids = torch.searchsorted(query_start_loc, token_ids, right=True) - 1
+        # skipped correctly. Clamp BEFORE any gather: searchsorted returns
+        # [0, num_rows + 1], so a padded token yields req_ids == num_rows,
+        # which is OOB for query_start_loc[req_ids + 1] (len num_rows + 1),
+        # seq_lens[req_ids] and block_table[req_ids] (both num_rows rows).
+        req_ids = torch.clamp(
+            torch.searchsorted(query_start_loc, token_ids, right=True) - 1,
+            min=0,
+            max=num_rows - 1,
+        )
         starts = query_start_loc[req_ids].to(torch.int64)
         ends = query_start_loc[req_ids + 1].to(torch.int64)
         # Global absolute position of each query token (rule: positions are
@@ -689,7 +712,15 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         )
         block_numbers = block_table[req_ids, block_ids].to(torch.int64)
         slot_ids = block_numbers * block_size + local_entry % block_size
-        valid = completes_entry & owned & (pos >= 0)
+        # `in_batch` restores the upstream contract that a padded token keeps
+        # the -1 sentinel. NOT redundant with the clamp: a clamped padded token
+        # lands on the last padded row with pos = token_id - real_total, which
+        # satisfies `completes_entry` whenever the cudagraph padding gap is >= 2
+        # (e.g. 5 reqs padded to 8 with compress_ratio 2 -> pos == 1). Such a
+        # write currently lands in NULL_BLOCK_ID (block 0, reserved) only
+        # because of gpu_model_runner.py:2347 -- benign by accident, not by
+        # construction.
+        valid = completes_entry & owned & (pos >= 0) & in_batch
         out[:num_tokens] = torch.where(
             valid, slot_ids, torch.full_like(slot_ids, -1)
         )
