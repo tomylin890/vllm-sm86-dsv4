@@ -11,7 +11,7 @@ Hardware and driver requirements are in the "Environment" section of README.md; 
 - Disk: the model is about 156GB in fp8 (P0 recorded 167GB pulling it from HF at the time, about 20 minutes), plus the precompiled wheel and the flash-mla build output; leave 200GB or more.
 - The model `deepseek-ai/DeepSeek-V4-Flash-0731` itself — pull it to the machine however you normally do, since the launch commands below take a local path.
 
-Do not set `PYTHONOPTIMIZE`. `python -O` strips asserts out entirely, and several geometry checks are exactly what fail closed via assert: the "stride vs write length" contract in KV block zeroing (`vllm/v1/worker/utils.py`), and the two dcp-related assertions in the hybrid coordinator (group type, block size divisibility, which is P11's B1/B2). Once they are stripped, an invalid configuration does not blow up; it quietly computes the wrong thing, or quietly boots. The rack kit's `verify_p11_B.sh` refuses to run when `PYTHONOPTIMIZE` has any value at all, for this reason.
+Do not set `PYTHONOPTIMIZE`. `python -O` strips asserts out entirely, and several geometry checks are exactly what fail closed via assert: the "stride vs write length" contract in KV block zeroing (`vllm/v1/worker/utils.py`), and the two dcp-related assertions in the hybrid coordinator (group type, block size divisibility, which is P11's B1/B2). Once they are stripped, an invalid configuration does not blow up; it quietly computes the wrong thing, or quietly boots. Refuse to start at all when `PYTHONOPTIMIZE` has any value, for this reason.
 
 ### Installing this branch
 
@@ -191,21 +191,25 @@ The SOP is one request at each of five representative lengths after boot:
 2048  16384  65536  131072  204800
 ```
 
-`warmup_sweep()` in `p11-rack-kit/verify_p11_A.sh` and `verify_p11_B.sh` does exactly this (`P11_WARMUP_LENGTHS`), and `P11_WARMUP_STRICT=1` is the default — any failed request exits and refuses to go further, because the numbers measured from that boot are not comparable. When measuring by hand, sweep twice and take the second pass; the first pass comes out half as fast, and that is not real performance.
+Any failed warmup request should abort the run rather than continue, because the numbers measured from that boot are not comparable. When measuring by hand, sweep twice and take the second pass; the first pass comes out half as fast, and that is not real performance.
 
 Under PROFILE-CACHE there is one more thing: the warmup itself fills the cache. Any later measurement that needs cold numbers has to use entirely fresh prompt content (the rack kit's T-series scripts salt the prompt) or another restart, otherwise what you measure is hits.
 
 Startup is complete when two things hold at the same time: `Route: /v1/models` appears in the log, and `GET /v1/models` really returns 200. Either one alone misleads — the route being mounted does not mean the engine can accept requests, and a refused connection before the route is mounted does not mean startup failed.
 
-### Launching with the rack kit
+### Reproducing the measured numbers
 
-The two scripts in `p11-rack-kit/` can be used to boot directly; they additionally do the pkill, wait for VRAM to drain, poll for READY, run the warmup sweep, and check boot facts (group count, scheduler block size, `num_gpu_blocks`), and on failure they give an exit code instead of leaving a half-dead engine behind.
-
-One catch: the scripts default to the P11 verification sizing (B is F=512, override 720), not the final production PROFILE-CACHE. To run the numbers above you have to override explicitly:
+`deploy/` holds the two launch scripts above as runnable files, plus `deploy/verify/`,
+the harnesses every number in the README was produced with. See
+[deploy/README.md](../deploy/README.md) for which harness answers which question.
 
 ```bash
-P11_F=768 P11_OVERRIDE=1000 P11_LONG_PREFILL_THRESHOLD=384 \
-  bash p11-rack-kit/verify_p11_B.sh
+MODEL=/path/to/DeepSeek-V4-Flash-0731 VLLM_BIN=/path/to/venv/bin/vllm \
+  deploy/launch-profile-cache.sh
 ```
 
-These two scripts also read the model path and the delta-gather budget from `~/dsv4-dcp/verify_mc5.sh` (`P11_REF_SCRIPT`), a file that lives only on the machine and not in the repo. Without it, name the model with `P11_MODEL=` directly; the budget falls back to 512 and prints a warn line.
+Before you boot, make sure no stale engine is holding VRAM: `pkill -9 -f "vllm serve"`,
+then poll `nvidia-smi --query-gpu=memory.used --format=csv,noheader` until every card is
+back under 500MiB. A boot that profiles memory against a polluted available figure sizes
+its KV pool wrong and fails later, in a place that looks unrelated.
+

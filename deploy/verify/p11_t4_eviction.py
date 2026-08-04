@@ -3,7 +3,7 @@
 
   python3 p11_t4_eviction.py run --log <serve-B-*.log> --out t4.json
 
-REQUIRES the T4 boot variant: P11_OVERRIDE=2600 P11_DEBUG_LOG=1 (the step-8
+REQUIRES a boot with a larger pool and VLLM_LOGGING_LEVEL=DEBUG (the
 "Cache hit reconciliation" line is debug-gated). 4 concurrent agent sessions,
 each >= 100k context, one turn per session per round, >= 8 rounds (>= 32
 turns). After every round: parse the new reconciliation lines from the serve

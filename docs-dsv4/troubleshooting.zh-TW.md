@@ -51,7 +51,7 @@ nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits
 
 `"vllm[ ]serve"`的方括號不是筆誤。`pkill -f`比對的是完整命令列，如果你用`ssh host 'pkill -f "vllm serve"'`，遠端那個`bash -c`的命令列裡自己就含有`vllm serve`這串字，於是它會殺掉自己、ssh當場斷線，而真正的引擎還活著。寫成`vllm[ ]serve`就解開了：這個regex仍然匹配得到真正的`vllm serve`命令列，但它自己的命令列上是字面的`vllm[ ]serve`，方括號沒被regex匹配到，自匹配就破了。同理，**kill和launch不要放在同一條ssh指令裡**。
 
-VRAM檢查是收尾條件，不是禮貌。`pkill -9`回來之後行程未必已經釋放記憶體，要輪詢到每張卡都掉回500MiB以下才能開下一輪，否則下一次boot會用一個被污染的可用量去做memory profiling。`p11-rack-kit/verify_p11_A.sh`的`kill_stale`與`wait_vram`就是這個順序的完整版（門檻是`P11_VRAM_IDLE_MIB`，預設500）。腳本裡寫的是不帶方括號的`vllm serve`，因為它是在機器上直接執行、自己的命令列不含那串字；只有從`ssh host '...'`裡下手時才需要上面那個方括號寫法。
+VRAM檢查是收尾條件，不是禮貌。`pkill -9`回來之後行程未必已經釋放記憶體，要輪詢到每張卡都掉回500MiB以下才能開下一輪，否則下一次boot會用一個被污染的可用量去做memory profiling。順序是：`pkill -9`、輪詢`nvidia-smi --query-gpu=memory.used`直到每張卡低於500MiB、才開下一輪。腳本裡寫的是不帶方括號的`vllm serve`，因為它是在機器上直接執行、自己的命令列不含那串字；只有從`ssh host '...'`裡下手時才需要上面那個方括號寫法。
 
 ### 開機時ncclUnhandledCudaError出現在PP的broadcast，但grep OutOfMemoryError一個都沒有
 
@@ -119,7 +119,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 DSV4 SM8x JIT warmup: mixed dummy runs at token sizes [...]
 ```
 
-但它蓋不完。實測boot之後仍然是每個新長度付一次學費，所以部署SOP是開機後從HTTP層再打一輪暖機請求（5個代表長度各一發，例如2048/16384/65536/131072/204800）再掛流量；`p11-rack-kit/verify_p11_A.sh`的`warmup_sweep`是可以照抄的版本，它用streaming發，連線卡住會變成timeout而不是無限等。
+但它蓋不完。實測boot之後仍然是每個新長度付一次學費，所以部署SOP是開機後從HTTP層再打一輪暖機請求（5個代表長度各一發，例如2048/16384/65536/131072/204800）再掛流量；用streaming發，連線卡住才會變成timeout而不是無限等。
 
 自己量測時掃兩輪取第二輪。第一輪的數字不是真實性能，把它寫進報告只會誤導自己。
 

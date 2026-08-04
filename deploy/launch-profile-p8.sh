@@ -57,7 +57,7 @@ export VLLM_LONG_PREFILL_THRESHOLD_ADAPTIVE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # ALONE: pairing it with
                                                           # max_split_size_mb silently disables it
 
-exec "$VLLM_BIN" serve "$MODEL" \
+"$VLLM_BIN" serve "$MODEL" \
   --served-model-name dsv4-flash-0731 --trust-remote-code \
   --kv-cache-dtype fp8 --block-size 256 \
   --tensor-parallel-size 4 --pipeline-parallel-size 2 \
@@ -72,3 +72,6 @@ exec "$VLLM_BIN" serve "$MODEL" \
   --no-enable-prefix-caching \
   --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4],"max_cudagraph_capture_size":4}' \
   --host "$HOST" --port "$PORT" 2>&1 | tee "$LOG"
+
+# The pipeline means $? is tee's; take vllm's instead.
+exit "${PIPESTATUS[0]}"

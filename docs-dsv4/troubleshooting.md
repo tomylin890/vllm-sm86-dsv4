@@ -51,7 +51,7 @@ The `VLLM::` one cannot be skipped. Worker process titles look like `VLLM::Worke
 
 The brackets in `"vllm[ ]serve"` are not a typo. `pkill -f` matches against the full command line, so if you run `ssh host 'pkill -f "vllm serve"'`, the remote `bash -c`'s own command line contains the string `vllm serve`, so it kills itself, ssh drops on the spot, and the real engine is still alive. Writing it as `vllm[ ]serve` unties that: the regex still matches the real `vllm serve` command line, but its own command line carries the literal text `vllm[ ]serve`, which the regex does not match, so the self-match is broken. For the same reason, **do not put the kill and the launch in one ssh command**.
 
-The VRAM check is a completion condition, not a courtesy. When `pkill -9` returns, the processes have not necessarily released their memory yet; you have to poll until every card has dropped back under 500MiB before starting the next round, otherwise the next boot does its memory profiling against a polluted available figure. `kill_stale` and `wait_vram` in `p11-rack-kit/verify_p11_A.sh` are the complete version of this sequence (the threshold is `P11_VRAM_IDLE_MIB`, default 500). The script writes `vllm serve` without brackets, because it runs directly on the machine and its own command line doesn't contain that string; you only need the bracket form above when going in through `ssh host '...'`.
+The VRAM check is a completion condition, not a courtesy. When `pkill -9` returns, the processes have not necessarily released their memory yet; you have to poll until every card has dropped back under 500MiB before starting the next round, otherwise the next boot does its memory profiling against a polluted available figure. The sequence is: `pkill -9`, then poll `nvidia-smi --query-gpu=memory.used` until every card is under 500MiB, and only then boot. The script writes `vllm serve` without brackets, because it runs directly on the machine and its own command line doesn't contain that string; you only need the bracket form above when going in through `ssh host '...'`.
 
 ### ncclUnhandledCudaError at boot in the PP broadcast, but grep OutOfMemoryError finds nothing
 
@@ -119,7 +119,7 @@ The engine's built-in warmup (`VLLM_DSV4_WARMUP`, on by default) walks the chunk
 DSV4 SM8x JIT warmup: mixed dummy runs at token sizes [...]
 ```
 
-But it doesn't cover everything. Measured, after boot you still pay the tuition once per new length, so the deployment SOP is to fire another round of warmup requests through the HTTP layer after boot (one each at 5 representative lengths, for example 2048/16384/65536/131072/204800) before putting traffic on it; `warmup_sweep` in `p11-rack-kit/verify_p11_A.sh` is a version you can copy as-is; it sends with streaming, so a stalled connection turns into a timeout instead of an unbounded wait.
+But it doesn't cover everything. Measured, after boot you still pay the tuition once per new length, so the deployment SOP is to fire another round of warmup requests through the HTTP layer after boot (one each at 5 representative lengths, for example 2048/16384/65536/131072/204800) before putting traffic on it; Send them with streaming, so a stalled connection turns into a timeout instead of an unbounded wait.
 
 When measuring yourself, sweep twice and take the second sweep. The first sweep's numbers are not real performance, and writing them into a report only misleads you.
 

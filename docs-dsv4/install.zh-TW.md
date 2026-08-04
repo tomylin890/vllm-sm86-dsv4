@@ -11,7 +11,7 @@
 - 磁碟：模型fp8約156GB（P0當時從HF拉下來記錄是167GB、約20分鐘），加上預編譯wheel與flash-mla的build產物，留200GB以上。
 - 模型`deepseek-ai/DeepSeek-V4-Flash-0731`本體，用你慣用的方式拉到本機即可，下面的啟動指令吃的是本機路徑。
 
-`PYTHONOPTIMIZE`不要設。`python -O`會把assert整個剝掉，而有幾處幾何檢查正是靠assert做fail-close的：KV區塊歸零的「步長vs寫入長度」契約（`vllm/v1/worker/utils.py`）、以及hybrid coordinator那兩條dcp相關的斷言（群組型別、block size整除，也就是P11那個B1/B2）。剝掉之後不合法的設定不會炸，會安靜地算錯或安靜地開起來。rack kit的`verify_p11_B.sh`直接拒絕在`PYTHONOPTIMIZE`有值時執行，就是這個原因。
+`PYTHONOPTIMIZE`不要設。`python -O`會把assert整個剝掉，而有幾處幾何檢查正是靠assert做fail-close的：KV區塊歸零的「步長vs寫入長度」契約（`vllm/v1/worker/utils.py`）、以及hybrid coordinator那兩條dcp相關的斷言（群組型別、block size整除，也就是P11那個B1/B2）。剝掉之後不合法的設定不會炸，會安靜地算錯或安靜地開起來。啟動腳本直接拒絕在`PYTHONOPTIMIZE`有值時執行，就是這個原因。
 
 ### 裝這個分支
 
@@ -64,7 +64,7 @@ print(hasattr(torch.ops.flash_mla, "fwd_sparse_decode_mla_partial"))
 PY
 ```
 
-TODO：`flash-mla-int`的公開來源URL。工程筆記裡寫的是`git fetch <clone-remote> dcp-sm86-patches`，沒有記下remote，我無法從樹裡驗證，先不寫一個可能錯的網址。
+`flash-mla-int`的來源是 https://github.com/AppMana/forks-flash-mla-int，本分支的`dcp-sm86-patches`就長在它上面。
 
 三件事值得說明。`FLASH_MLA_CUDA_ARCHS=86`把nvcc釘在`sm_86`，那個repo的預設是`80`，用預設編出來的東西在3090上跑不到原生路徑。`--no-build-isolation`是必要的：這個擴充要對著venv裡那顆torch的ABI編，隔離的build環境會自己抓一顆torch，編出來的`.so`載入時才會爆。torch版本的檢查刻意放在build前而不是boot時：這個擴充走torch-stable ABI、支援torch>=2.9，venv裡比這舊就該當場停下來，而不是等到第一次decode才發現。
 
@@ -191,21 +191,20 @@ SOP是開機後對五個代表長度各發一次：
 2048  16384  65536  131072  204800
 ```
 
-`p11-rack-kit/verify_p11_A.sh`與`verify_p11_B.sh`的`warmup_sweep()`就是在做這件事（`P11_WARMUP_LENGTHS`），而且預設`P11_WARMUP_STRICT=1`——任何一發失敗就退出並拒絕往下跑，因為那一輪boot量出來的數字不可比。自己手動量測時掃兩輪取第二輪，第一輪的數字會低一半，那不是真實性能。
+任何一發暖機失敗都應該中止而不是繼續，因為那一輪boot量出來的數字不可比。自己手動量測時掃兩輪取第二輪，第一輪的數字會低一半，那不是真實性能。
 
 PROFILE-CACHE下多一件事：暖機本身會把cache填起來。之後任何需要冷啟數字的量測都必須用全新的prompt內容（rack kit的T系列腳本會給prompt加鹽）或重開一次機，否則量到的是命中。
 
 啟動完成的判準是兩件事同時成立：日誌出現`Route: /v1/models`，且`GET /v1/models`真的回200。只看其中一個都會誤判——路由掛上了不代表引擎已經能接請求，而在路由掛上之前連線被拒也不代表啟動失敗。
 
-### 用rack kit啟動
+### 重現上面那些數字
 
-`p11-rack-kit/`裡的兩支腳本可以直接拿來開機，它們額外做了pkill、等VRAM排空、READY輪詢、暖機掃描、以及開機事實檢查（群組數、scheduler block size、`num_gpu_blocks`），失敗會給出退出碼而不是留一個半死的引擎。
-
-要注意腳本的預設值是P11驗證期的sizing（B是F=512、override 720），不是最終production的PROFILE-CACHE。要跑上面那組數字得顯式覆寫：
+`deploy/`裡有上面兩組配置的可執行腳本，以及`deploy/verify/`——README每一個數字都是那些harness量出來的，哪一支回答哪個問題見[deploy/README.md](../deploy/README.md)。
 
 ```bash
-P11_F=768 P11_OVERRIDE=1000 P11_LONG_PREFILL_THRESHOLD=384 \
-  bash p11-rack-kit/verify_p11_B.sh
+MODEL=/path/to/DeepSeek-V4-Flash-0731 VLLM_BIN=/path/to/venv/bin/vllm \
+  deploy/launch-profile-cache.sh
 ```
 
-這兩支腳本還會從`~/dsv4-dcp/verify_mc5.sh`讀模型路徑與delta-gather預算（`P11_REF_SCRIPT`），那個檔案只在機器上、不在repo裡。沒有它就用`P11_MODEL=`直接指定，預算會退回512並印一行warn。
+開機前先確認沒有殘留的引擎佔著VRAM：`pkill -9 -f "vllm serve"`，然後輪詢`nvidia-smi --query-gpu=memory.used --format=csv,noheader`直到每張卡都回到500MiB以下。用一個被污染的可用量去做memory profiling，KV池會被算錯，而失敗會發生在看起來不相干的地方。
+
