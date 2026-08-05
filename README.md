@@ -267,5 +267,5 @@ The flash-mla patch branch is MIT (Copyright (c) 2025 DeepSeek), compatible with
 
 - Built on [haosdent/vllm](https://github.com/haosdent/vllm) — DeepSeek-V4-Flash support for vLLM
 - The compression-preserving DCP design derives from Lasimeri's context-parallelism work; attribution notes are in `sm86_dcp_layout.py`, `sparse_attn_indexer.py` and `dcp.py`
-- The flash-mla sm86 sparse kernel integration is built on [AppMana/forks-flash-mla-int](https://github.com/AppMana/forks-flash-mla-int), the flash-mla fork this branch actually derives from
+- The flash-mla sm86 sparse kernel integration is built on [AppMana/forks-flash-mla-int](https://github.com/AppMana/forks-flash-mla-int), the flash-mla fork this branch derives from. The four P9 commits this fork adds on top live at [tomylin890/flash-mla-sm86-dsv4](https://github.com/tomylin890/flash-mla-sm86-dsv4), branch `dcp-sm86-patches` — that is the one to build
 - [AppMana/forks-vllm-consumer-nvidia-platforms](https://github.com/AppMana/forks-vllm-consumer-nvidia-platforms) was consulted as a reference for what is achievable on consumer GPUs. No code was taken from it, and the tree contains no reference to it

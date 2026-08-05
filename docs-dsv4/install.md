@@ -64,7 +64,9 @@ print(hasattr(torch.ops.flash_mla, "fwd_sparse_decode_mla_partial"))
 PY
 ```
 
-`flash-mla-int` is a clone of `https://github.com/AppMana/forks-flash-mla-int`, and `dcp-sm86-patches` is the branch this build is made from. If the tree is not on the machine yet, clone that remote to `~/dsv4-dcp/flash-mla-int` before running the commands above.
+Clone https://github.com/tomylin890/flash-mla-sm86-dsv4 and build the `dcp-sm86-patches` branch. That repository is [AppMana/forks-flash-mla-int](https://github.com/AppMana/forks-flash-mla-int) plus the four P9 commits this fork needs: the partial sparse-decode op and its Python export.
+
+The export is the part that bites. Building AppMana's branch directly gives you the CUDA kernel but not `sparse_mla_decode_fp8_partial` in `flash_mla/__init__.py`, so the server loads the weights, gets as far as CUDA graph capture, and dies with `ImportError: cannot import name 'sparse_mla_decode_fp8_partial'`. Do not paper over it with a wrapper that falls back to the non-partial op: the partial op returns (out, lse, pre-sink) for the cross-rank merge, and the non-partial one does not, so the fallback either crashes or computes the wrong thing.
 
 Three things are worth explaining. `FLASH_MLA_CUDA_ARCHS=86` pins nvcc to `sm_86`; that repo defaults to `80`, and what the default produces does not reach the native path on a 3090. `--no-build-isolation` is required: this extension has to be compiled against the ABI of the torch in the venv, and an isolated build environment pulls its own torch, so the `.so` it produces only blows up when it is loaded. The torch version check is deliberately placed before the build rather than at boot: the extension uses the torch-stable ABI and supports torch>=2.9, so anything older in the venv should stop you right there instead of surfacing at the first decode.
 

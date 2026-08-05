@@ -64,7 +64,9 @@ print(hasattr(torch.ops.flash_mla, "fwd_sparse_decode_mla_partial"))
 PY
 ```
 
-`flash-mla-int`的來源是 https://github.com/AppMana/forks-flash-mla-int，本分支的`dcp-sm86-patches`就長在它上面。
+clone https://github.com/tomylin890/flash-mla-sm86-dsv4 並建置`dcp-sm86-patches`分支。那個repo是[AppMana/forks-flash-mla-int](https://github.com/AppMana/forks-flash-mla-int)再加上本專案P9的四個commit：partial sparse-decode算子與它的Python匯出。
+
+會咬人的是匯出那一段。直接建置AppMana的分支會拿到CUDA kernel但`flash_mla/__init__.py`裡沒有`sparse_mla_decode_fp8_partial`，於是server載完權重、走到CUDA graph捕獲階段才死在`ImportError: cannot import name 'sparse_mla_decode_fp8_partial'`。不要用一個「找不到就退回非partial版」的wrapper去蓋過它：partial算子回傳的是(out, lse, pre-sink)三元組給跨rank合併用，非partial版沒有，退回去不是崩就是算錯。
 
 三件事值得說明。`FLASH_MLA_CUDA_ARCHS=86`把nvcc釘在`sm_86`，那個repo的預設是`80`，用預設編出來的東西在3090上跑不到原生路徑。`--no-build-isolation`是必要的：這個擴充要對著venv裡那顆torch的ABI編，隔離的build環境會自己抓一顆torch，編出來的`.so`載入時才會爆。torch版本的檢查刻意放在build前而不是boot時：這個擴充走torch-stable ABI、支援torch>=2.9，venv裡比這舊就該當場停下來，而不是等到第一次decode才發現。
 
