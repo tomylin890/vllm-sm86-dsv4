@@ -469,6 +469,19 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     # within the flashmla_sparse workspace.
     # For DeepSeek-V3.2, the max_model_len is 163840.
     #   40 * 163840 * 132 = 865075200 bytes = 825 MB
+    #
+    # That sizing assumes the flashmla_sparse workspace is what you have to
+    # fit inside. On SM8x there is no such workspace, and the reservation is
+    # instead resident for the process lifetime in the shared arena (see
+    # v1/worker/workspace.py), where it pins hundreds of MiB that the
+    # realizable chunk size never uses: the chunker at
+    # split_indexer_prefill_chunks bounds a chunk by this same number, but the
+    # largest chunk a scheduler step can actually produce is
+    # max_num_seqs * cdiv(max_model_len, compress_ratio). The override lets a
+    # deployment state the real ceiling; 0 keeps the upstream value.
+    override = envs.VLLM_DSV4_INDEXER_PREFILL_BUFFER_TOKENS
+    if override > 0:
+        return override
     return max_model_len * 40
 
 

@@ -112,6 +112,33 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        # PREFILL_CHUNK_SIZE is two things at once: the loop stride over
+        # prefill requests (``num_chunks = cdiv(num_prefills, CHUNK)``) and
+        # the first dimension of the bf16 kv-gather workspace allocated in
+        # ``_forward_prefill``. That workspace is resident for the process
+        # lifetime -- the arena grows to the largest request any caller ever
+        # makes and is then frozen (v1/worker/workspace.py) -- so on 24 GiB
+        # cards it is one of the few allocations that is neither weights nor
+        # KV pool and still big enough to matter. With
+        # M = cdiv(max_model_len, compress_ratio) + sliding_window +
+        # max_num_batched_tokens = 65536 + 128 + 768 = 66432 it costs
+        # CHUNK * M * head_dim * 2 bytes: 259.5 MiB at 4, 129.75 MiB at 2.
+        #
+        # Lowering it is a MEMORY choice, not an invariant. The loop is
+        # correct at any value -- every consumer is chunk-relative -- but a
+        # step carrying more concurrent prefills than the stride takes an
+        # extra pass, and each pass is one more DCP all-gather per compressed
+        # layer on the eager prefill path. The launch profiles run
+        # --max-num-seqs 4, so 3-4 co-scheduled prefills (reachable below
+        # ~10-20k context) do pay that.
+        #
+        # Set per instance rather than as a ClassVar because this class is
+        # selected for device_capability.major == 8 -- A100, A40, A6000, L4,
+        # L40S and 4090 as well as the 3090s this was tuned on. Unset keeps
+        # the parent's 4, so those cards behave exactly as before.
+        _chunk = envs.VLLM_DSV4_PREFILL_CHUNK_SIZE
+        if _chunk > 0:
+            self.PREFILL_CHUNK_SIZE = _chunk
         vllm_config = get_current_vllm_config()
         parallel_config = vllm_config.parallel_config
         self._dcp_size = parallel_config.decode_context_parallel_size

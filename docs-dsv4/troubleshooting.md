@@ -169,6 +169,36 @@ VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=64
 
 The measured cost below 128k is about 1% (5194 against 5231 tok/s unpruned), and it buys turning the 253952 cell from a guaranteed failure into a stable pass. These two values are caps on transient workspaces, not on the pool; cutting them does not move `GPU KV cache size`.
 
+### Free memory sits at single-digit MiB under sustained load, and there is nothing left to trim
+
+Measured on this stack: through a 25-request multi-turn agent benchmark, free memory on the tightest GPU bottomed out at **2 MiB**. It did not OOM, but two megabytes is not a margin.
+
+The first two things you will try both make it worse, and both fail loudly at boot rather than silently:
+
+**Do not "fix" the uneven pipeline partition.** vLLM logs `Hidden layers were unevenly partitioned: [22,21]` and helpfully names `VLLM_PP_LAYER_PARTITION`. Setting `21,22` refuses to boot. This model alternates CSA (`compress_ratio` 4) and HCA (`compress_ratio` 128) layers whose KV footprints differ by 32x, so balancing *layer count* is not balancing *memory* — moving one layer changes a stage's `block_stride` by one page and the binding stage flips. The refusal is a 0.02% miss, not a wall: `[21,22]` boots at `--num-gpu-blocks-override 1010` and is worth about +72 MiB on the tight side, because it also swaps which stage is tight. It is a swap with a small remainder, not a reclaim.
+
+**`--num-gpu-blocks-override` is not a cap, it is the answer to the startup check.** With it set, `available_memory` is replaced by `override * bytes_per_block` (`v1/core/kv_cache_utils.py`, the override branch), and that is what gets compared against the memory one max-length request needs. At 262144 the requirement is 0.44 GiB and 1000 blocks supplies 0.45 GiB — a 2% margin. Lowering the override to 930 does not free memory, it fails the check. There is no slack in that number to reclaim.
+
+What actually moves is the workspace arena. It grows to the largest request any caller ever makes and is then frozen for the process lifetime, so whatever pins it high stays pinned. Two knobs cut it:
+
+```
+VLLM_DSV4_INDEXER_PREFILL_BUFFER_TOKENS=1048576   # = max_num_seqs * max_model_len
+VLLM_DSV4_PREFILL_CHUNK_SIZE=2
+```
+
+Both are needed: the arena takes the max of its callers, so cutting the second while the first still pins 331 MiB buys nothing. Together they take the locked arena from **331.00 MB to 129.75 MB**. Confirm it in one boot with `VLLM_DEBUG_WORKSPACE=1` and read the `[WORKSPACE DEBUG] Workspace locked. Current sizes:` line; if it is not 129.75 the same logger names whichever caller became the new ceiling.
+
+Measured end to end on 8x3090 at 262144 with prefix caching, tight-GPU minimum free through the agent benchmark:
+
+| | tight-GPU min free | decode | prefill 18k / 60k / 135k |
+|---|---|---|---|
+| baseline | 2 MiB | 51.2 | 3327 / 3276 / 3022 |
+| + transient caps (`DELTA_GATHER_BUDGET_MB=128`, `MAX_LOGITS_MB=48`, `--max-num-seqs 2`) | 90 MiB | 51.06 | 3262 / 3151 / 2988 |
+| + the two arena knobs | 270 MiB | 51.26 | 3221 / 3133 / 2946 |
+| + `VLLM_PP_LAYER_PARTITION=21,22` and blocks 1010 | **362 MiB** | 50.83 | 3273 / 3212 / 2998 |
+
+Retrieval was re-verified at the end state: 40/40 cells cold and warm, zero cold-versus-warm cell mismatches. Note that the last row is measured at `--max-num-seqs 2`; the launch profiles ship 4, and that combination has not been measured.
+
 ### Two concurrent requests, decode drops to 5 tok/s
 
 First check whether `--long-prefill-token-threshold` is greater than half of `--max-num-batched-tokens`. When the two are equal, one long prefill eats the entire per-step token budget, and the second request can't get in until the first one's prefill finishes; you end up with "one decoding while the other prefills," and a scheduler step filled by prefill only advances decode by one token — measured 4.2-4.8 tok/s, against 50 for a single stream.

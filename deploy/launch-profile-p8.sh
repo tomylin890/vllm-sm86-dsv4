@@ -57,6 +57,19 @@ export VLLM_LONG_PREFILL_THRESHOLD_ADAPTIVE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # ALONE: pairing it with
                                                           # max_split_size_mb silently disables it
 
+# Two caps on the process-lifetime workspace arena. The arena grows to the
+# largest request any caller ever makes and is then frozen, so whatever these
+# pin stays pinned -- on 24 GiB cards that is the difference between ~90 MiB
+# and ~290 MiB of free memory at steady state. Both default to upstream
+# behaviour when unset; see envs.py for the failure modes.
+#   BUFFER_TOKENS: raw tokens, floor is max_num_seqs * max_model_len. Upstream
+#   uses max_model_len * 40, which pins ~331 MiB here. Raise this in lockstep
+#   with --max-num-seqs below -- too low fails SILENTLY.
+export VLLM_DSV4_INDEXER_PREFILL_BUFFER_TOKENS=$(( 4 * MAXLEN ))
+#   CHUNK_SIZE: halves a ~260 MiB bf16 gather buffer. Correct at any value;
+#   a step with more concurrent prefills than this takes an extra pass.
+export VLLM_DSV4_PREFILL_CHUNK_SIZE=2
+
 # Not set by default, but this is the profile where it can fit. vLLM
 # auto-enables VLLM_USE_BREAKABLE_CUDAGRAPH for DeepseekV4ForCausalLM, which
 # sets CompilationMode.NONE and turns inductor off; decode then launches

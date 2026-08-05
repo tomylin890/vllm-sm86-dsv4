@@ -169,6 +169,36 @@ VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=64
 
 代價實測在128k以下約1%（5194對照未修剪的5231 tok/s），換來253952那一格從必死變成穩定通過。這兩個值是暫態工作區的上限，不是池子，砍它們不會動到`GPU KV cache size`。
 
+### 持續負載下空閒記憶體只剩個位數MiB，而且看起來沒東西可以砍了
+
+實測：跑一輪25個請求的多輪agent基準，最緊那張卡的空閒記憶體最低掉到**2 MiB**。它沒有OOM，但兩百萬分之一張卡不叫餘裕。
+
+你會想到的前兩件事都會讓情況更糟，而且都是在開機時大聲失敗而不是靜默出錯：
+
+**不要去「修」那個不平衡的PP切分。** vLLM會記錄`Hidden layers were unevenly partitioned: [22,21]`，還好心告訴你可以用`VLLM_PP_LAYER_PARTITION`。設成`21,22`會拒絕開機。這個模型是CSA（`compress_ratio` 4）和HCA（`compress_ratio` 128）交替，兩者的KV佔用差32倍，所以平衡**層數**不等於平衡**記憶體**——搬動一層會讓某一側的`block_stride`少一個page，綁定的那一側就翻過去了。那個拒絕是差0.02%而不是撞牆：`[21,22]`配上`--num-gpu-blocks-override 1010`就能開機，緊側大約多72 MiB，但**它同時也把緊的是哪一側換掉了**。那是一次帶小額找零的對調，不是回收。
+
+**`--num-gpu-blocks-override`不是上限，它就是啟動檢查的答案本身。** 設了它之後，`available_memory`會被換成`override * bytes_per_block`（`v1/core/kv_cache_utils.py`的override分支），而那個數字才是拿去跟「一個滿長度請求需要多少」比對的對象。262144的需求是0.44 GiB，1000個block供給0.45 GiB——**只有2%的餘量**。把override降到930不會釋放記憶體，只會讓檢查不過。那個數字裡沒有可以回收的空間。
+
+真正能動的是workspace arena。它會長到所有呼叫者曾經要過的最大值，然後在行程生命週期內凍結，所以把它撐高的東西會一直佔著。兩個旋鈕砍它：
+
+```
+VLLM_DSV4_INDEXER_PREFILL_BUFFER_TOKENS=1048576   # = max_num_seqs * max_model_len
+VLLM_DSV4_PREFILL_CHUNK_SIZE=2
+```
+
+**兩個都要設**：arena取的是所有呼叫者的最大值，所以在第一個還釘著331 MiB的情況下砍第二個，收益是零。兩個一起把鎖定的arena從**331.00 MB降到129.75 MB**。開機時加`VLLM_DEBUG_WORKSPACE=1`看`[WORKSPACE DEBUG] Workspace locked. Current sizes:`那一行就能一次確認；如果不是129.75，同一個logger會告訴你是哪個呼叫者變成新的天花板。
+
+8×3090、262144、開prefix caching下的完整實測，數字是agent基準全程最緊那張卡的最低空閒：
+
+| | 緊側最低空閒 | decode | prefill 18k / 60k / 135k |
+|---|---|---|---|
+| 基準 | 2 MiB | 51.2 | 3327 / 3276 / 3022 |
+| ＋暫態上限（`DELTA_GATHER_BUDGET_MB=128`、`MAX_LOGITS_MB=48`、`--max-num-seqs 2`）| 90 MiB | 51.06 | 3262 / 3151 / 2988 |
+| ＋兩個arena旋鈕 | 270 MiB | 51.26 | 3221 / 3133 / 2946 |
+| ＋`VLLM_PP_LAYER_PARTITION=21,22`與blocks 1010 | **362 MiB** | 50.83 | 3273 / 3212 / 2998 |
+
+最終狀態重新驗證過檢索能力：40格冷熱全通過，冷熱逐格零不一致。注意最後一列是在`--max-num-seqs 2`下量的；launch profile出貨的是4，那個組合沒有量過。
+
 ### 兩條請求併發，decode掉到5 tok/s
 
 先確認`--long-prefill-token-threshold`有沒有大於`--max-num-batched-tokens`的一半。相等時一條長prefill會吃光每步的token預算，第二條請求要等第一條prefill完才進得來，於是變成「一條decode時另一條在prefill」，而被prefill佔滿的排程步只讓decode前進一個token——實測4.2-4.8 tok/s，對照單流的50。

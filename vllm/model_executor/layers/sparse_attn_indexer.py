@@ -782,6 +782,23 @@ def sparse_attn_indexer(
                     f"num_tokens={hidden_states.shape[0]}"
                 )
             assert chunk.local_cu_seq_lens is not None
+            # The two slices below CLAMP rather than raise, and the gather
+            # kernel takes its row count from the clamped view and simply
+            # early-returns past it -- so a workspace that is too small does
+            # not fail, it silently leaves stale rows for the indexer to
+            # score. That reads as a quality regression, never as an error.
+            # Both operands are host ints and identical on every DCP rank, so
+            # this raises symmetrically and cannot desync the collectives.
+            if chunk.max_local_total_seq_lens > k_quant_full.shape[0]:
+                raise RuntimeError(
+                    "indexer prefill gather workspace too small: layer="
+                    f"{k_cache_prefix} needs {chunk.max_local_total_seq_lens} "
+                    f"rows, reserved {k_quant_full.shape[0]}. Raise "
+                    "VLLM_DSV4_INDEXER_PREFILL_BUFFER_TOKENS (currently "
+                    f"{envs.VLLM_DSV4_INDEXER_PREFILL_BUFFER_TOKENS}) to at "
+                    "least max_num_seqs * max_model_len, or unset it to fall "
+                    "back to the upstream reservation."
+                )
             k_quant = k_quant_full[: chunk.max_local_total_seq_lens]
             k_scale = k_scale_full[: chunk.max_local_total_seq_lens]
             if not chunk.skip_kv_gather and chunk.local_total_seq_lens > 0:

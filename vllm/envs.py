@@ -132,6 +132,8 @@ if TYPE_CHECKING:
     VLLM_DSV4_SM86_INDEXER_TILES: bool = False
     VLLM_DSV4_DELTA_GATHER: bool = False
     VLLM_DSV4_DELTA_GATHER_BUDGET_MB: int = 512
+    VLLM_DSV4_INDEXER_PREFILL_BUFFER_TOKENS: int = 0
+    VLLM_DSV4_PREFILL_CHUNK_SIZE: int = 0
     VLLM_LONG_PREFILL_THRESHOLD_ADAPTIVE: bool = False
     VLLM_DSV4_COMPRESSOR_WINDOWED: bool = False
     VLLM_DSV4_COMPRESSOR_WINDOW: int = 512
@@ -1293,6 +1295,40 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DSV4_DELTA_GATHER_BUDGET_MB": lambda: int(
         os.getenv("VLLM_DSV4_DELTA_GATHER_BUDGET_MB", "512")
+    ),
+    # Ceiling, in GLOBAL compressed-stream tokens, for the sparse indexer's
+    # prefill workspace reservation. 0 (the default) keeps upstream's
+    # ``max_model_len * 40``, which is sized so the reservation fits inside
+    # the flashmla_sparse workspace -- correct on cards where that workspace
+    # exists, and enormous on 24 GiB SM8x cards, where it pins ~331 MiB of a
+    # process-lifetime arena that the realizable chunk size never comes close
+    # to filling. The value is in RAW tokens; the reservation it sizes is
+    # ``value // compress_ratio`` rows, while the chunker compares the same
+    # number against COMPRESSED sums -- so the safe floor that satisfies both
+    # consumers is ``max_num_seqs * max_model_len``.
+    #
+    # Too low fails SILENTLY, not loudly. The request size is a constant, so
+    # the arena lock never trips; the shortfall clamps a slice in
+    # sparse_attn_indexer and the gather kernel writes fewer rows, leaving
+    # stale data for the indexer to score. Do not tune this below the floor.
+    # The guard at sparse_attn_indexer.py (before the k_quant slice) turns
+    # that into a raise; it is the only thing standing between a wrong value
+    # and quietly degraded output.
+    "VLLM_DSV4_INDEXER_PREFILL_BUFFER_TOKENS": lambda: int(
+        os.getenv("VLLM_DSV4_INDEXER_PREFILL_BUFFER_TOKENS", "0")
+    ),
+    # Loop stride over prefill requests on the SM8x path, and the first
+    # dimension of the bf16 kv-gather workspace that stride sizes. 0 (the
+    # default) keeps the base class's 4, so an unset environment behaves
+    # exactly like upstream on every Ampere card -- and this dispatch covers
+    # far more than the 3090s it was tuned on (device_capability.major == 8
+    # is A100/A40/A6000/L4/L40S/4090 as well). Halving it halves a ~260 MiB
+    # process-lifetime allocation. It is a memory choice, not an invariant:
+    # the chunk loop is correct at any value, but a step with more concurrent
+    # prefills than the stride takes an extra pass, and each pass costs one
+    # more DCP all-gather per compressed layer.
+    "VLLM_DSV4_PREFILL_CHUNK_SIZE": lambda: int(
+        os.getenv("VLLM_DSV4_PREFILL_CHUNK_SIZE", "0")
     ),
     # P8: windowed (ring) placement for the DeepseekV4 fp32 compressor-state
     # KV groups (SlidingWindowMLASpec). Today those groups are addressed by
