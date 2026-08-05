@@ -59,6 +59,27 @@ export VLLM_LONG_PREFILL_THRESHOLD_ADAPTIVE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # ALONE: pairing it with
                                                           # max_split_size_mb silently disables it
 
+# Deliberately NOT set. vLLM auto-enables VLLM_USE_BREAKABLE_CUDAGRAPH for
+# DeepseekV4ForCausalLM, which sets CompilationMode.NONE and so turns inductor
+# off; decode then launches thousands of un-fused kernels per token. Setting it
+# to 0 turns inductor back on and fuses them. Whether that is a win depends
+# entirely on how fast your host launches kernels, and it is not free:
+#
+#   host                   per-kernel launch   decode with inductor    prefill
+#   Zen3 desktop, 8c       4.21 us             +4%   (51.1 -> 53.2)    -3.8%
+#   Zen2 server, 64c       8.21 us             +126% (23.4 -> 52.9)    +32%
+#
+# The cost is ~1.2 GiB per GPU of extra weights+workspace, which on 24 GiB
+# cards is mutually exclusive with this profile: the pool here is 650 blocks of
+# admission reservation plus 256 blocks of 262144 context, and there is no
+# 1.2 GiB to give back. Measured, it boots and then dies on a long prefill.
+#
+# So: leave it alone on a fast host. On a slow-launch host, uncomment it AND
+# accept a shorter max_model_len or switch to launch-profile-p8.sh, whose ring
+# placement reserves ~3 blocks instead of 650.
+#
+#   export VLLM_USE_BREAKABLE_CUDAGRAPH=0
+
 "$VLLM_BIN" serve "$MODEL" \
   --served-model-name dsv4-flash-0731 --trust-remote-code \
   --kv-cache-dtype fp8 --block-size 256 \

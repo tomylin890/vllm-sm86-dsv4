@@ -119,9 +119,44 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 DSV4 SM8x JIT warmup: mixed dummy runs at token sizes [...]
 ```
 
-但它蓋不完。實測boot之後仍然是每個新長度付一次學費，所以部署SOP是開機後從HTTP層再打一輪暖機請求（5個代表長度各一發，例如2048/16384/65536/131072/204800）再掛流量；用streaming發，連線卡住才會變成timeout而不是無限等。
+但它蓋不完。實測boot之後仍然是每個新長度付一次學費，所以部署SOP是開機後從HTTP層再打一輪暖機請求，掛流量之前跑完：
+
+```bash
+python3 deploy/warmup.py --base-url http://127.0.0.1:8000
+```
 
 自己量測時掃兩輪取第二輪。第一輪的數字不是真實性能，把它寫進報告只會誤導自己。
+
+這個很容易被誤判成記憶體問題，因為從客戶端看到的就是那樣：冷的100k prefill要付編譯稅、再加上半速，輕鬆衝破60秒的客戶端timeout，看起來就是卡死。在你去找一個根本不存在的OOM之前，先在日誌裡找`JIT compilation during inference`。
+
+### decode大約只有README數字的一半，但GPU看起來完全正常
+
+先查host CPU，其他都放後面。這裡的decode是kernel-launch bound不是GPU bound，所以decode吞吐跟著你的host單執行緒速度走，不是跟著顯卡走。
+
+症狀很有特徵：decode落在一半左右、prefill只差一點、兩者都不隨上下文長度變化，而GPU完全無辜——滿boost時脈、記憶體時脈在P2上限、沒有任何throttle旗標作用中，而且`utilization.gpu`在80幾%但`utilization.memory`不到10%。最後這一組就是關鍵：SM是被佔著的，卻幾乎沒在搬資料，因為它在等host把下一個kernel餵過來。
+
+兩台8×3090、同一個commit、同一份配置下實測：
+
+| host | 每個kernel的發射成本 | decode | prefill @135k |
+|---|---|---|---|
+| Zen3桌機、8核 | 4.21 us | 51.1 tok/s | 3032 |
+| Zen2伺服器、64核 | 8.21 us | 23.4 tok/s | 2436 |
+
+核心多沒有用，kernel launch是單執行緒的。這個成本跟核心時脈成反比，而CUDA graph replay不受影響——把同一台機器壓到1500 MHz，launch變成16.17 us，graph replay仍然是約1.13 us。這也是為什麼在這裡關掉graph特別貴：開graph每個token 42.8 ms，關掉是112.5 ms。
+
+要量自己的host，就把一大批瑣碎kernel先用eager跑一次、再用捕獲成graph跑一次計時。如果eager的數字比graph差很多，你的天花板就在host。
+
+有一個旋鈕，但要付代價。vLLM會對`DeepseekV4ForCausalLM`自動打開`VLLM_USE_BREAKABLE_CUDAGRAPH`，那會把編譯模式設成`CompilationMode.NONE`、等於關掉inductor，於是沒有任何算子融合，decode每個token要發射數千個kernel。設成`0`就把inductor轉回來：
+
+```
+VLLM_USE_BREAKABLE_CUDAGRAPH=0
+```
+
+在慢的那台host上是decode **+126%**（23.4 → 52.9 tok/s）、prefill +32%，並且用needle驗證到258k tokens都正確。在快的那台上是decode +4%、prefill **−3.8%**——因為本來就沒剩多少發射開銷可以省。
+
+它的代價是每張卡約1.2 GiB。在24 GiB的卡上，這跟262144的PROFILE-CACHE互斥：池子是650個block的admission預留加上256個block的上下文，沒有1.2 GiB可以讓。實測是啟動成功、短請求正常、長prefill掛掉。而且拉高`--gpu-memory-utilization`救不了——真正卡住的從來不是池子，是峰值活化的餘裕。PROFILE-P8的預留是約3個block而不是650，帳面上有空間，但那個組合還沒有量過。
+
+這個旗標**沒有**驗證過的項目：`deploy/verify/p11_t1_equality.py`，也就是cache命中對比全重算的token同一性檢查。把inductor當成一個通過了needle與算術檢查的吞吐選項，不要當成已驗證的配置。
 
 ### 掃到190k以上時OOM僵死
 

@@ -119,9 +119,44 @@ The engine's built-in warmup (`VLLM_DSV4_WARMUP`, on by default) walks the chunk
 DSV4 SM8x JIT warmup: mixed dummy runs at token sizes [...]
 ```
 
-But it doesn't cover everything. Measured, after boot you still pay the tuition once per new length, so the deployment SOP is to fire another round of warmup requests through the HTTP layer after boot (one each at 5 representative lengths, for example 2048/16384/65536/131072/204800) before putting traffic on it; Send them with streaming, so a stalled connection turns into a timeout instead of an unbounded wait.
+But it doesn't cover everything. Measured, after boot you still pay the tuition once per new length, so the deployment SOP is to fire another round of warmup requests through the HTTP layer after boot, before putting traffic on it:
+
+```bash
+python3 deploy/warmup.py --base-url http://127.0.0.1:8000
+```
 
 When measuring yourself, sweep twice and take the second sweep. The first sweep's numbers are not real performance, and writing them into a report only misleads you.
+
+This one is easy to misread as a memory failure, because that is what it looks like from the client: a cold 100k prefill pays the compile tax on top of a half-speed run, blows past a 60-second client timeout, and reads as a hang. Check the log for `JIT compilation during inference` before you go looking for an OOM that isn't there.
+
+### Decode is about half the number in the README, and the GPUs look fine
+
+Check the host CPU before anything else. Decode here is kernel-launch bound, not GPU bound, so decode throughput tracks your host's single-thread speed rather than your cards.
+
+The symptom is specific: decode lands near half, prefill is only mildly off, both are flat across context length, and the GPUs are innocent — full boost clock, memory clock at the P2 ceiling, no throttle flag active, and `utilization.gpu` in the 80s while `utilization.memory` sits under 10%. That last pair is the tell. The SMs are occupied but barely moving data, because they are waiting on the host to hand them the next kernel.
+
+Measured on two 8x3090 machines running the identical commit and configuration:
+
+| host | per-kernel launch | decode | prefill @135k |
+|---|---|---|---|
+| Zen3 desktop, 8 cores | 4.21 us | 51.1 tok/s | 3032 |
+| Zen2 server, 64 cores | 8.21 us | 23.4 tok/s | 2436 |
+
+More cores does not help; kernel launch is one thread. The cost scales inversely with core clock, and CUDA graph replay does not — forcing the same machine to 1500 MHz took launch to 16.17 us while graph replay stayed at ~1.13 us. That is also why disabling graphs is so expensive here: 42.8 ms per token with them, 112.5 ms without.
+
+To measure your own host, time a large batch of trivial kernels eagerly and then the same batch captured in a graph. If the eager number is much worse than the graphed one, the host is your ceiling.
+
+There is a lever, with a real price. vLLM auto-enables `VLLM_USE_BREAKABLE_CUDAGRAPH` for `DeepseekV4ForCausalLM`, which sets `CompilationMode.NONE` and turns inductor off, so nothing gets fused and decode launches thousands of kernels per token. Setting it to `0` turns inductor back on:
+
+```
+VLLM_USE_BREAKABLE_CUDAGRAPH=0
+```
+
+On the slow host that is +126% decode (23.4 -> 52.9 tok/s) and +32% prefill, verified correct on a needle out to 258k tokens. On the fast host it is +4% decode and *-3.8%* prefill, because there was little launch overhead left to remove.
+
+It costs about 1.2 GiB per GPU. On 24 GiB cards that is mutually exclusive with PROFILE-CACHE at 262144: the pool is 650 blocks of admission reservation plus 256 blocks of context, and there is nothing to give back. Measured, it boots, serves short requests, and dies on a long prefill. Raising `--gpu-memory-utilization` does not rescue it — the pool was never the binding constraint, the peak activation headroom was. PROFILE-P8 reserves ~3 blocks instead of 650 and so has the room on paper, but that combination has not been measured.
+
+Not verified with this flag: `deploy/verify/p11_t1_equality.py`, the cache-hit-versus-recompute token identity check. Treat inductor as a throughput option that has passed needle and arithmetic checks, not as a validated configuration.
 
 ### OOM hang when sweeping at 190k and above
 

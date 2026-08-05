@@ -27,9 +27,23 @@ Both default to `max_model_len` 262144, TP4 + PP2 + dcp4, and fp8 KV. Every
 flag is explained in [docs/install.md](../docs-dsv4/install.md); the reasoning
 behind the two profiles is in the top-level README.
 
-After boot, send one request at each length you care about before you measure
-anything. Triton compiles per chunk-count bucket on first sight, so the first
-request at a new length runs at roughly half speed and that number is not real.
+## Warming up — before you measure anything, and before you put traffic on it
+
+```bash
+python3 warmup.py --base-url http://127.0.0.1:8000
+```
+
+Not optional, and not the same thing as the engine's built-in
+`VLLM_DSV4_WARMUP`. That one covers the compressed-gather chunk ladder and the
+mixed token sizes. It does not cover the axis Triton actually buckets on, which
+is how many prefill chunks one request consumes — and that axis is tied to
+request length, so the first request at every length you have not served yet
+still compiles for 7-11.5 seconds and then runs at roughly half speed.
+
+Skipping it does not look like a warmup problem. It looks like a broken
+deployment: a long prefill appears to hang, and every number you measure is
+about half of what the machine can do. The measured numbers are in
+[docs/troubleshooting.md](../docs-dsv4/troubleshooting.md).
 
 ## Verifying
 

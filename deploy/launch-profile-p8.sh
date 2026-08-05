@@ -57,6 +57,24 @@ export VLLM_LONG_PREFILL_THRESHOLD_ADAPTIVE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # ALONE: pairing it with
                                                           # max_split_size_mb silently disables it
 
+# Not set by default, but this is the profile where it can fit. vLLM
+# auto-enables VLLM_USE_BREAKABLE_CUDAGRAPH for DeepseekV4ForCausalLM, which
+# sets CompilationMode.NONE and turns inductor off; decode then launches
+# thousands of un-fused kernels per token, and the bill for that lands on the
+# host, not the GPU. Measured per-kernel launch cost: 4.21 us on a Zen3
+# desktop part, 8.21 us on a Zen2 server part, and it scales inversely with
+# core clock (1500 MHz -> 16.17 us, 2450 MHz -> 8.34 us; graph replay is
+# unaffected at ~1.13 us either way). So the slower your host launches, the
+# more inductor buys: +4% decode on the fast host, +126% on the slow one.
+#
+# It costs ~1.2 GiB per GPU. PROFILE-CACHE cannot pay that on 24 GiB cards --
+# its absolute placement reserves 650 blocks per request. The ring here
+# reserves ~3, so on paper the room exists. NOT MEASURED in this combination;
+# if you try it, watch `Available KV cache memory` at boot and prove a
+# near-max-length prefill before trusting it.
+#
+#   export VLLM_USE_BREAKABLE_CUDAGRAPH=0
+
 "$VLLM_BIN" serve "$MODEL" \
   --served-model-name dsv4-flash-0731 --trust-remote-code \
   --kv-cache-dtype fp8 --block-size 256 \
