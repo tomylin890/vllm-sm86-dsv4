@@ -7,6 +7,8 @@ from collections.abc import Callable
 
 import torch
 
+import vllm.envs as envs
+
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import (
@@ -330,6 +332,19 @@ def fused_marlin_moe(
     for block_size_m in [8, 16, 32, 48, 64]:
         if M * topk / E / block_size_m < 0.9:
             break
+
+    # Deployment override (see the envs.py note): for many-expert / low-topk
+    # models the occupancy heuristic above pads far more mma rows than the
+    # tokens it covers, and a smaller block trades weight re-reads for
+    # issued FLOPs -- profitable iff the MoE GEMM is compute-bound, so it
+    # is a measured per-machine knob rather than a new heuristic.
+    _forced_block_m = envs.VLLM_MARLIN_MOE_BLOCK_SIZE_M
+    if _forced_block_m > 0:
+        assert _forced_block_m in (8, 16, 32, 48, 64), (
+            f"VLLM_MARLIN_MOE_BLOCK_SIZE_M={_forced_block_m} is not a "
+            "supported Marlin moe_block_size (8/16/32/48/64)"
+        )
+        block_size_m = _forced_block_m
 
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)

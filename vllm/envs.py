@@ -192,6 +192,7 @@ if TYPE_CHECKING:
     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
+    VLLM_MARLIN_MOE_BLOCK_SIZE_M: int = 0
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
@@ -1659,6 +1660,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The activation dtype for marlin kernel
     "VLLM_MARLIN_INPUT_DTYPE": env_with_choices(
         "VLLM_MARLIN_INPUT_DTYPE", None, ["int8", "fp8"]
+    ),
+    # Override the Marlin MoE M-block size (0 = keep the built-in
+    # heuristic). The heuristic targets ~0.9 tokens-per-expert-slot
+    # occupancy, which for a 256-expert / top-6 model at prefill chunk
+    # sizes (M*topk/E ~ 18 at F=768) lands on block_size_m=32 and pads
+    # every expert's row run to 32 -- ~1.78x the real M-rows of mma work,
+    # because tokens-per-expert is Poisson(~18) and almost every expert
+    # sits in [1, 32). block_size_m=16 trades ~1.6x expert-weight re-reads
+    # for ~0.81x issued FLOPs, which wins when the MoE GEMM is
+    # compute-bound (measured so on 8x RTX 3090 at a 200 W power limit)
+    # and loses when it is memory-bound -- so this is a knob, not a new
+    # default; A/B it per machine. Values must be one of the kernel's
+    # supported sizes (8/16/32/48/64); the int8-input >=16 clamp still
+    # applies after the override. Bit-exactness: block_size_m only
+    # partitions independent output rows, and both MoE GEMM launches pin
+    # use_atomic_add=False / use_fp32_reduce=True, so the k-loop stays a
+    # single sequential fp32 accumulation per output element.
+    "VLLM_MARLIN_MOE_BLOCK_SIZE_M": lambda: int(
+        os.getenv("VLLM_MARLIN_MOE_BLOCK_SIZE_M", "0")
     ),
     # The online quantization dtype for humming kernel
     "VLLM_HUMMING_ONLINE_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
