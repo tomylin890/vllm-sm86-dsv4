@@ -231,3 +231,11 @@ block_sizes=[...], hash_block_size=...
 你同時設了`VLLM_DSV4_COMPRESSOR_WINDOWED=1`和`--enable-prefix-caching`。這是刻意的硬性拒絕，不會靜默降級——兩種擺法的KV佔用差以GB計，靜默選一邊只會在很久之後以入場拒絕或OOM的形式回來。照訊息挑一組配置，理由見「兩組配置怎麼選」。
 
 有一處要注意：這則訊息裡建議PROFILE-CACHE把`max_num_batched_tokens`壓到512，那是當初寫這段守衛時的保守值。後來實測出來的上限是768（見「兩組配置怎麼選」的記憶體帳），以768為準。訊息本身還沒改。
+
+### Prefill 比 README 每張表都低 ~15%，而且各長度掉的比例一致
+
+如果每個長度都往下平移一個近乎固定的比例、decode 完全不動，先查 commit 區間再動旋鈕：dc5487ef2（跨請求清零涵蓋修復）初版帶著一筆平坦的 ~40 µs/token 稅。fp32 壓縮器狀態 group 以 4-8 token 的粒度配塊——F=768 每步約 290 個 id——而每個 id 都被丟進「全部 segment × 最大 segment 的 chunk 數」的 launch grid：每步數百萬個幾乎全部提前退出的 thread block。51783a09b（per-group 清零）在涵蓋完全相同的前提下把它收回來；表格數字在該 commit 之後可以重現。
+
+同一筆稅也是那段期間「調 F 沒感覺」的原因：平坦的每 token 成本會壓縮快配置之間的差距，F=512→768 實測只剩 +7%，不是表上的 +26%。如果拉高 F 對 prefill 幾乎沒作用，先懷疑哪裡多了一筆平坦的每步/每 token 成本，再懷疑 batching 路徑本身——特徵就是每個長度虧損比例一模一樣。
+
+開機會印一行清零 segment 表的普查（`KVBlockZeroer segments: flat=N per-group={...}`）。每個會配塊的 group 都必須出現且數量合理；在這個配置上 per-group 總和會**大於** flat，因為 packed 佈局讓每個 group 的第一層都別名到同一個位址，那個 segment 在每個 group 各出現一次。如果哪個 group 缺席，代表清零涵蓋在初始化時就靜默丟了——那要停下來處理，是正確性的洞，不是效能備註。

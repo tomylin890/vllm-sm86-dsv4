@@ -88,6 +88,8 @@ Needle-in-a-haystack, 5 context lengths × 8 depths, 40 cells total:
 
 Identical cell for cell is the key point: it is not only that the totals match, but that the same two cells fail and fail in the same way, so the cache did not change model behavior. The miss the two have in common sits at 253952, depth 0.2, which is the real retrieval limit at the 256K edge and has nothing to do with the cache.
 
+Re-validated on the current head (per-group zeroing plus the arena reclaim, running the production trim below): the same 40-cell grid passes 40/40 cold and 40/40 warm, zero mismatches, this time including the 253952/0.2 cell. That cell sits at the 256K edge and flips between runs — read 38-40 as its honest band rather than reading an improvement into one sample. A concurrent variant was also run: two sessions (100k and 160k, distinct codewords) submitted together so the pool over-subscribes and blocks recycle across requests mid-flight; both needles retrieve correctly with no cross-contamination.
+
 ## Choosing between the two profiles
 
 There are two ways to place the compressor state, and they are mutually exclusive:
@@ -111,6 +113,8 @@ The reason the two are mutually exclusive is that the ring placement addresses b
 For agents that trade is worth taking. A 5-turn session at 200k pays 57 seconds on every turn without the cache, 287 seconds in total; with the cache only the first turn pays (about 11 seconds more because of the F downgrade), and the remaining four turns come to under 3 seconds. That is over 150 seconds saved on a single session, and the gap widens the longer the session runs.
 
 If the workload is one-shot long document processing, PROFILE-P8 is the answer. The cache has nothing to work with, and F=1024 throughput is the thing that matters.
+
+The tables above are the shipped launch script's values. The reference machine's production now runs a further trim on top of PROFILE-CACHE: `--num-gpu-blocks-override 1010`, `--max-num-seqs 2`, delta-gather budget 128 MB, and `VLLM_PP_LAYER_PARTITION=21,22` — the default split hands the extra layer to PP0, which is already the tighter stage; mirroring it evens the free-memory floor. Together with the workspace-arena reclaim (331 → 130 MB, see the memory notes in `docs-dsv4/`), the floor under sustained 262144 load goes from single-digit MiB to roughly 850 MiB free, measured after a full-length request. Prefill under this trim at a 200W power limit: 4,033 / 3,968 / 3,679 / 3,385 tok/s at 16k / 65k / 131k / 200k, which is the power table's 200W column within noise.
 
 ## Environment
 
