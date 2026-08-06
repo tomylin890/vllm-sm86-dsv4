@@ -349,8 +349,18 @@ def _fp8_mqa_logits_kernel(
     # bf16 q/k inputs: the wrapper pre-decodes FP8 → bf16. At compute-bound
     # prefill this is ~2× the in-kernel LUT (LUT lookups contend with the
     # matmul for ALU/regs). Paged-decode keeps the LUT path.
-    m = tl.program_id(0)
-    n_block = tl.program_id(1)
+    # Axis order is deliberate: n_block on program_id(0) makes consecutive
+    # CTAs sweep K tiles for a FIXED query row, so the operand that must stay
+    # resident between reuses is the K span (a few MB per chunk once the
+    # budget is DCP-local -- fits GA102's 6 MB L2), and Q streams from HBM
+    # exactly once. The transposed order (m fastest) kept a single 16 KB
+    # K tile hot but re-streamed the full multi-MB Q block once per n_block
+    # -- gigabytes of redundant Q traffic per layer per step at long
+    # context. Same math, same store targets, only CTA dispatch order
+    # changes: every output element is still produced by one CTA with one
+    # full-width tl.dot, so the swap is bit-identical.
+    m = tl.program_id(1)
+    n_block = tl.program_id(0)
 
     n_start = n_block * BLOCK_N
     offs_n = n_start + tl.arange(0, BLOCK_N)
@@ -461,8 +471,10 @@ def fp8_mqa_logits_triton(
     q_bf16 = q.to(torch.bfloat16)
     k_bf16 = k_fp8.to(torch.bfloat16)
 
-    # Grid depends on the autotuned BLOCK_N.
-    grid = lambda meta: (M, triton.cdiv(N, meta["BLOCK_N"]))  # noqa: E731
+    # Grid depends on the autotuned BLOCK_N. n_blocks ride program_id(0)
+    # (see the axis-order note in the kernel); M rides program_id(1), whose
+    # 65535 limit is far above the largest chunk row count (<= F).
+    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]), M)  # noqa: E731
     _get_mqa_logits_kernel()[grid](
         q_bf16,
         k_bf16,
