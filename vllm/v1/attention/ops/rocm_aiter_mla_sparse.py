@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import LayerNameType
@@ -25,6 +26,8 @@ from vllm.v1.attention.ops.sm86_det_topk import (
     det_top_k_per_row_prefill,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
+
+logger = init_logger(__name__)
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX942, _ON_GFX950
@@ -1000,10 +1003,53 @@ def _get_cached_wo_a_bf16(
             hidden_dim,
         )
         cached = (wo_a_weight * wo_a_scale).to(torch.bfloat16)
-    else:
-        cached = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
-            torch.bfloat16
+        wo_a._dsv4_wo_a_bf16 = cached
+        # The bf16 cache is now the only thing this path ever reads, and on
+        # the platforms that reach it (CUDA SM8x via DeepseekV4AmpereMLA ->
+        # DeepseekV4ROCMAiterMLA inheritance, and ROCm itself) the einsum
+        # below is the ONLY runtime consumer of wo_a.weight -- the Marlin
+        # scaled_mm kernel exempts is_bmm layers from repack and never
+        # apply_weights() them, and the SM90 deep_gemm o_proj path never
+        # runs here. Keeping the fp8 original alive therefore duplicates
+        # every wo_a: ~8.4 MB fp8 + scales next to the 16.8 MB bf16 cache,
+        # per layer group, per rank -- ~180 MiB across 43 layers on the
+        # 8x24GB deployment, real margin on a machine that runs single-digit
+        # hundreds of MiB from the edge. Release the originals in place.
+        #
+        # The dequant above always materializes fresh storage
+        # ((fp32 copy * scale).to(bf16)), so dropping the source is safe.
+        # The Parameter objects stay (hasattr checks remain true); a later
+        # weight RELOAD into this layer (sleep/wake, weight sync) would hit
+        # a loud shape mismatch on the emptied tensors rather than silently
+        # recomputing a stale cache -- fail-loud is intended.
+        #
+        # Under VLLM_DSV4_WARMUP=1 the first forward happens during boot
+        # warmup, so in production the release lands at startup and the
+        # profiler's steady-state accounting sees the deduplicated layout.
+        freed = wo_a.weight.numel() * wo_a.weight.element_size() + (
+            wo_a.weight_scale_inv.numel() * wo_a.weight_scale_inv.element_size()
         )
+        wo_a.weight.data = torch.empty(
+            0, dtype=wo_a.weight.dtype, device=wo_a.weight.device
+        )
+        wo_a.weight_scale_inv.data = torch.empty(
+            0,
+            dtype=wo_a.weight_scale_inv.dtype,
+            device=wo_a.weight_scale_inv.device,
+        )
+        logger.debug_once(
+            "wo_a fp8 originals released after bf16 cache build "
+            "(%d bytes/layer-group reclaimed)",
+            freed,
+        )
+        return cached
+    # Unquantized wo_a: .to(bfloat16) on an already-bf16 weight returns the
+    # SAME tensor (no copy) -- the "cache" aliases wo_a.weight's storage, so
+    # there is nothing duplicated to release and freeing the original would
+    # free the cache with it. Leave it alone.
+    cached = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
+        torch.bfloat16
+    )
     wo_a._dsv4_wo_a_bf16 = cached
     return cached
 
