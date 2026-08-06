@@ -22,12 +22,16 @@ _PREFILL_AUTOTUNE_CONFIGS = [
     triton.Config({"BLOCK_N": 128}, num_warps=4, num_stages=ns) for ns in (2, 4)
 ]
 
-# P6 (VLLM_DSV4_SM86_INDEXER_TILES): the consumer fork's SM86 (RTX 3090 /
-# A5000) tiles for this kernel family. The fork launches its prefill logits
-# kernel at BLOCK_N=64 / num_warps=4 with Triton's default num_stages=3
-# (ref: nvidia_imma/triton_kernels.py, fp8_mqa_logits_triton), and its paged
-# kernel at num_warps=4 / default stages. TILING/PIPELINING ONLY -- the
-# reduction blocks are deliberately NOT transplanted:
+# P6 (VLLM_DSV4_SM86_INDEXER_TILES): the SM86 (RTX 3090 / A5000) tiles for
+# this kernel family. The prefill BLOCK_N was originally transplanted from
+# the consumer fork's launch parameters (BLOCK_N=64 / num_warps=4, ref:
+# nvidia_imma/triton_kernels.py) -- a ported value, not a measurement on
+# this hardware, and it contradicted this file's own sweep above, which
+# found BLOCK_N=128 fastest at every shape swept and BN=64 1.25-1.40x
+# worse. The SM86 config now uses the swept value; num_stages stays at the
+# fork's 3 (the upstream configs benchmark 2 vs 4, and a single fixed
+# config keeps the no-autotune boot determinism). TILING/PIPELINING ONLY --
+# the reduction blocks are deliberately NOT transplanted:
 #   - BLOCK_D (the tl.dot k-dim, our "BLOCK_K") stays next_pow2(head_dim):
 #     the fork chunks head_dim at BLOCK_D=64 with `scores +=` across chunks,
 #     which SPLITS the fp32 dot accumulation and changes rounding. Our single
@@ -38,7 +42,7 @@ _PREFILL_AUTOTUNE_CONFIGS = [
 # also removes the 2-config autotune benchmark -- one less boot-to-boot
 # nondeterminism source on the A/B path.
 _SM86_PREFILL_TILE_CONFIGS = [
-    triton.Config({"BLOCK_N": 64}, num_warps=4, num_stages=3)
+    triton.Config({"BLOCK_N": 128}, num_warps=4, num_stages=3)
 ]
 _SM86_PAGED_TILE_CONFIGS = [triton.Config({}, num_warps=4, num_stages=3)]
 
