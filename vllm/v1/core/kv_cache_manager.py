@@ -793,12 +793,14 @@ class KVCacheManager:
             truncated.append(list(group_blocks[:num_blocks]))
         return self.create_kv_cache_blocks(tuple(truncated))
 
-    def take_new_block_ids(self) -> list[int]:
-        """Drain and return new attention block IDs for zeroing."""
-        ids: list[int] = []
-        for mgr in self.coordinator.single_type_managers:
-            ids.extend(mgr.take_new_block_ids())
-        return ids
+    def take_new_block_ids(self) -> list[list[int]]:
+        """Drain and return new attention block IDs for zeroing, one list
+        per kv-cache group (indexed by kv_cache_group_id), so the worker can
+        zero each group's ids against only that group's own segments."""
+        return [
+            mgr.take_new_block_ids()
+            for mgr in self.coordinator.single_type_managers
+        ]
 
     def get_zeroing_block_ids_in_range(
         self, request_id: str, start_token: int, end_token: int

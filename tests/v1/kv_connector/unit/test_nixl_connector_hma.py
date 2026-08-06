@@ -959,14 +959,14 @@ def test_scheduler_filters_connector_loaded_blocks_from_zeroing():
 
     class FakeKVCacheManager:
         def take_new_block_ids(self):
-            return [9, 10, 11, 12]
+            return [[9, 10, 11, 12]]
 
     scheduler = object.__new__(Scheduler)
     scheduler.needs_kv_cache_zeroing = True
     scheduler.kv_cache_manager = FakeKVCacheManager()
     scheduler._skip_zero_block_ids = {10, 12}
 
-    assert scheduler._get_new_block_ids_to_zero() == [9, 11]
+    assert scheduler._get_new_block_ids_to_zero() == [[9, 11]]
     assert not scheduler._skip_zero_block_ids
 
 
@@ -995,7 +995,7 @@ def test_failed_load_rezeroes_unwritten_skipped_blocks():
     # Attention blocks covering tokens >= 48 are re-recorded for zeroing
     # and flow into the next step's zero list; Mamba blocks are not.
     scheduler._skip_zero_block_ids = set()
-    assert scheduler._get_new_block_ids_to_zero() == [13, 14, 15]
+    assert scheduler._get_new_block_ids_to_zero() == [[13, 14, 15], []]
 
 
 # ── Mamba N-1 prefill tests ──────────────────────────────────────────────

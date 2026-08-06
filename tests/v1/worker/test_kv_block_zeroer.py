@@ -354,3 +354,72 @@ def test_kv_first_restrided_layout_keeps_k_and_v_inside_one_block():
     assert n_segs == 1
     assert [int(x) for x in seg_page_sizes] == [2 * h]
     assert [int(x) for x in seg_block_strides] == [2 * h]
+
+
+def test_ctor_keeps_aliased_offset_zero_segments_per_group():
+    """Packed-slab layouts restart every group's byte offset at 0 inside one
+    shared slab, so each group's first layer has the SAME data_ptr. The flat
+    table dedups that address globally; each group's OWN table must still
+    carry it, or zero_block_groups() silently skips the group and the
+    block's previous tenant's bytes survive into the next request."""
+    device = torch.device("cpu")
+    num_blocks, page = 4, 8
+    slab = torch.zeros((num_blocks, page), dtype=torch.int32, device=device)
+
+    def make_group(gid: int) -> SimpleNamespace:
+        spec = FullAttentionSpec(
+            block_size=1, num_kv_heads=1, head_size=1, dtype=torch.float32
+        )
+        backend = SimpleNamespace(get_kv_cache_block_dim=lambda *a, **k: 0)
+        return SimpleNamespace(
+            kv_cache_spec=spec,
+            backend=backend,
+            kv_cache_group_id=gid,
+            layer_names=[f"l{gid}"],
+        )
+
+    zeroer = KVBlockZeroer(
+        device,
+        attn_groups_iter=[make_group(0), make_group(1)],
+        kernel_block_sizes=[1, 1],
+        cache_dtype="auto",
+        runner_only_attn_layers=None,
+        static_forward_context={
+            "l0": SimpleNamespace(kv_cache=slab),
+            "l1": SimpleNamespace(kv_cache=slab),
+        },
+    )
+    # BOTH groups must own a segment table containing the shared address.
+    assert set(zeroer._metas) == {0, 1}
+    for gid in (0, 1):
+        assert int(zeroer._metas[gid][0][0]) == slab.data_ptr()
+        assert zeroer._metas[gid][5] == 1
+    # The flat table keeps the global dedup: one segment, not two.
+    assert zeroer._meta is not None
+    assert zeroer._meta[5] == 1
+
+
+def test_cpu_runner_zero_block_ids_accepts_per_group_lists():
+    """The CPU override must consume the per-group nested list. Feeding the
+    nested list through tensor indexing would return a COPY (advanced
+    indexing) and .zero_() would silently never touch the cache."""
+    from vllm.v1.worker.cpu_model_runner import CPUModelRunner
+
+    kv = torch.ones(16, 2, 8, dtype=torch.float32)
+    spec = FullAttentionSpec(
+        block_size=1, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    stub = SimpleNamespace(
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=spec, layer_names=["l0"])
+            ]
+        ),
+        compilation_config=SimpleNamespace(
+            static_forward_context={"l0": SimpleNamespace(kv_cache=kv)}
+        ),
+    )
+    CPUModelRunner._zero_block_ids(stub, [[9, 10], []])
+    assert kv[9].sum() == 0
+    assert kv[10].sum() == 0
+    assert kv[8].sum() != 0

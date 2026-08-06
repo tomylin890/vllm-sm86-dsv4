@@ -138,9 +138,28 @@ class KVBlockZeroer:
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
         seen_ptrs: set[int] = set()
+        # Per-group dedup key. The packed DeepseekV4 layout restarts every
+        # group's byte offset at 0 inside ONE shared slab, so each group's
+        # first layer has the SAME data_ptr. Deduping that address globally
+        # would silently delete those segments from the group's OWN table --
+        # zero_block_groups() would then skip the group entirely and the
+        # block's previous tenant's bytes would survive into the next
+        # request (the exact cross-tenant hole the coverage fix closed).
+        # The flat table keeps the global dedup (its coverage does not
+        # depend on which group registered the address); the per-group
+        # tables dedup per (group, address).
+        seen_group_ptrs: set[tuple[int, int]] = set()
         seg_addrs: list[int] = []
         seg_page_sizes: list[int] = []
         seg_block_strides: list[int] = []
+        # Per-group segment tables for zero_block_groups: the same segments,
+        # bucketed by kv_cache_group_id so each group's allocations can be
+        # zeroed against only its own payload with its own chunk geometry.
+        per_group: dict[int, tuple[list[int], list[int], list[int]]] = {}
+        self._metas: dict[
+            int,
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int],
+        ] = {}
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
@@ -171,8 +190,11 @@ class KVBlockZeroer:
                 if not isinstance(kv, torch.Tensor):
                     continue
                 dp = kv.data_ptr()
-                if dp in seen_ptrs:
+                gkey = (group.kv_cache_group_id, dp)
+                if gkey in seen_group_ptrs:
                     continue
+                seen_group_ptrs.add(gkey)
+                is_new_flat = dp not in seen_ptrs
                 seen_ptrs.add(dp)
 
                 el = kv.element_size()
@@ -230,11 +252,18 @@ class KVBlockZeroer:
                 cur_page_el = cur_page_bytes // 4
                 cur_block_stride_el = cur_stride_bytes // 4
 
+                g_addrs, g_pages, g_strides = per_group.setdefault(
+                    group.kv_cache_group_id, ([], [], [])
+                )
                 for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
                     off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
-                    seg_addrs.append(dp + off_bytes)
-                    seg_page_sizes.append(cur_page_el)
-                    seg_block_strides.append(cur_block_stride_el)
+                    if is_new_flat:
+                        seg_addrs.append(dp + off_bytes)
+                        seg_page_sizes.append(cur_page_el)
+                        seg_block_strides.append(cur_block_stride_el)
+                    g_addrs.append(dp + off_bytes)
+                    g_pages.append(cur_page_el)
+                    g_strides.append(cur_block_stride_el)
 
         if not seg_addrs:
             self._meta = None
@@ -252,6 +281,27 @@ class KVBlockZeroer:
             max_page_size_el // blk_size,
             blk_size,
             len(seg_addrs),
+        )
+        for gid, (g_addrs, g_pages, g_strides) in per_group.items():
+            g_blk = min(
+                min(largest_power_of_2_divisor(ps) for ps in g_pages), 1024
+            )
+            self._metas[gid] = (
+                torch.tensor(g_addrs, dtype=torch.uint64, device=self.device),
+                torch.tensor(g_pages, dtype=torch.int64, device=self.device),
+                torch.tensor(g_strides, dtype=torch.int64, device=self.device),
+                max(g_pages) // g_blk,
+                g_blk,
+                len(g_addrs),
+            )
+        # Boot census: one deterministic line to eyeball after any layout
+        # change. Every group that allocates blocks must appear here with a
+        # plausible segment count; a missing or short group means zeroing
+        # coverage was lost at init, not at some far-away request.
+        logger.info(
+            "KVBlockZeroer segments: flat=%d per-group=%s",
+            len(seg_addrs),
+            {gid: m[5] for gid, m in sorted(self._metas.items())},
         )
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
@@ -280,10 +330,69 @@ class KVBlockZeroer:
             BLOCK_SIZE=blk_size,
         )
 
+    def zero_block_groups(self, groups: list[list[int]]) -> None:
+        """Zero each group's freshly-allocated block ids against ONLY that
+        group's own segments.
+
+        Coverage contract is unchanged from :meth:`zero_block_ids` -- every
+        attention-family group zeroes its OWN payload at its OWN acquisition
+        of a block, and a reader only ever addresses a block through its own
+        group's block table -- but the launch grid is per-group. The flat
+        launch pays ``n_ids x every_segment x the largest segment's chunk
+        count`` for every id: under the packed DeepseekV4 slab the fp32
+        compressor-state groups allocate hundreds of tiny-payload blocks per
+        prefill step (one per 4-8 tokens), and running each of them through
+        the full-slab grid of mostly early-exiting thread blocks cost ~30 ms
+        per step -- a flat ~40 us/token, i.e. a ~15% single-stream prefill
+        tax at F=768 that also flattened the F=512 -> 768 uplift from +26%
+        to +7%. Per-group, the same ids launch against a few segments with
+        their own (small) chunk count and the cost returns to memset scale.
+        """
+        for gid, block_ids in enumerate(groups):
+            if not block_ids:
+                continue
+            meta = self._metas.get(gid)
+            # A group that RECORDS ids but has no segment table would lose
+            # zeroing coverage silently -- fail loudly instead. (Groups that
+            # never record -- Mamba, encoder-only appended past
+            # kernel_block_sizes -- always arrive here with an empty list.)
+            assert meta is not None, (
+                f"kv-cache group {gid} recorded {len(block_ids)} block ids "
+                "for zeroing but the zeroer has no segments for it; "
+                "coverage would be silently lost"
+            )
+            (
+                seg_addrs,
+                seg_page_sizes,
+                seg_block_strides,
+                max_chunks,
+                blk_size,
+                n_segs,
+            ) = meta
+            n_blocks = len(block_ids)
+            idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
+            grid = (n_blocks * n_segs * max_chunks,)
+            _zero_kv_blocks_kernel[grid](
+                seg_addrs,
+                seg_page_sizes,
+                seg_block_strides,
+                idx,
+                n_blocks,
+                N_SEGS=n_segs,
+                MAX_CHUNKS=max_chunks,
+                BLOCK_SIZE=blk_size,
+            )
+
     def warmup(self, num_kv_blocks: int) -> None:
         """JIT-compile the zeroing kernel before the first real request."""
         if num_kv_blocks > 0:
             self.zero_block_ids([0])
+            # Each group's launch is a distinct constexpr specialization
+            # (N_SEGS / MAX_CHUNKS / BLOCK_SIZE differ per group); compile
+            # every one now rather than on the first real prefill step.
+            metas = getattr(self, "_metas", None)
+            if metas:
+                self.zero_block_groups([[0]] * (max(metas) + 1))
 
 
 @dataclass

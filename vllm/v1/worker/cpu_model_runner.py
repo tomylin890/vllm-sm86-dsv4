@@ -167,10 +167,21 @@ class CPUModelRunner(GPUModelRunner):
     def _sync_device(self) -> None:
         pass
 
-    def _zero_block_ids(self, block_ids: list[int]) -> None:
+    def _zero_block_ids(self, block_id_groups: list[list[int]]) -> None:
         # Zero full-attention blocks to prevent stale data corruption on partial writes.
         # Encoder-only (runner-only) layers are not FullAttentionSpec, so the
         # spec filter below already excludes them; no runner-only skip needed.
+        #
+        # The scheduler ships ids per kv-cache group; flattening is a safe
+        # superset here (block ids are globally unique in the shared pool,
+        # and this override zeroes every full-attention tensor the same way
+        # the pre-per-group code did). Iterating the nested list directly
+        # through tensor indexing would silently no-op: kv[[9, 10]] is
+        # advanced indexing and returns a COPY, so .zero_() would never
+        # touch the cache.
+        block_ids = [b for group_ids in block_id_groups for b in group_ids]
+        if not block_ids:
+            return
         seen_ptrs: set[int] = set()
         for group in self.kv_cache_config.kv_cache_groups:
             if not isinstance(group.kv_cache_spec, FullAttentionSpec):
