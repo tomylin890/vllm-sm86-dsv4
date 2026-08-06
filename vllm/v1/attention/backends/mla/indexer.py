@@ -23,6 +23,7 @@ from vllm.utils.deep_gemm import (
     is_deep_gemm_supported,
 )
 from vllm.utils.platform_utils import num_compute_units
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -426,6 +427,17 @@ class DeepSeekV32IndexerDecodeMetadata:
     requires_padding: bool
     schedule_metadata: torch.Tensor
     global_seq_lens: torch.Tensor | None = None
+    # Rank-invariant upper bound on any value in `seq_lens` -- i.e. the
+    # widest logits row the decode top-k can ever read -- in the SAME space
+    # `seq_lens` was transformed into by the builder (compressed and/or
+    # DCP-localized). The builder sets it beside each seq_lens transform so
+    # width and content provably travel together. -1 = not provided; the
+    # consumer then falls back to the global uncompressed max_seq_len,
+    # which is always sufficient (compress_ratio * dcp_world_size wider
+    # than necessary). It must be an upper bound identical on every DCP
+    # rank: a per-rank exact max would shrink the paged-logits grid
+    # differently per rank and silently skip owned KV blocks.
+    logits_width: int = -1
 
 
 @dataclass
@@ -1080,6 +1092,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # DCP: localize the now-expanded per-token global bounds to this
             # rank's owned KV. Done here (after expansion) so each token's global
             # causal length is localized individually; see the comment above.
+            decode_logits_width = -1
             if dcp_local_seq_lens is not None and self.compress_ratio > 1:
                 # P2b (SM8x DSV4 DCP; unreachable without VLLM_SM86_DCP --
                 # __init__ raises for dcp>1 + compress_ratio>1 otherwise).
@@ -1106,9 +1119,27 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 )
                 seq_lens_buffer.copy_(local_compressed_seq_lens)
                 seq_lens = seq_lens_buffer
+                # seq_lens are now LOCAL COMPRESSED entries; the widest row is
+                # bounded by ceil(ceil(max_tokens / m) / world) (+1 covers the
+                # interleave remainder). Global inputs only -> rank-invariant.
+                decode_logits_width = (
+                    cdiv(
+                        cdiv(
+                            common_attn_metadata.max_seq_len,
+                            self.compress_ratio,
+                        ),
+                        self.dcp_world_size,
+                    )
+                    + 1
+                )
             elif dcp_local_seq_lens is not None:
                 seq_lens = self._dcp_localize_decode_seq_lens(
                     seq_lens, num_decodes, seq_lens_is_buffer_view
+                )
+                # LOCAL uncompressed tokens.
+                decode_logits_width = (
+                    cdiv(common_attn_metadata.max_seq_len, self.dcp_world_size)
+                    + 1
                 )
             # For DeepseekV4 (compress_ratio > 1), the indexer KV cache stores
             # compressed tokens. Convert uncompressed seq_lens to compressed.
@@ -1122,6 +1153,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     )
                     self.expanded_seq_lens_buffer[num_decodes:num_decode_tokens] = 0
                     seq_lens = self.expanded_seq_lens_buffer[:num_decode_tokens]
+
+            if decode_logits_width < 0:
+                # No DCP localization happened above: seq_lens are GLOBAL,
+                # compressed iff compress_ratio > 1.
+                decode_logits_width = cdiv(
+                    common_attn_metadata.max_seq_len, self.compress_ratio
+                )
 
             # Non-MTP: deep_gemm paged MQA logits requires 2D context_lens
             # (csrc/apis/attention.hpp). Unsqueeze to (B, 1) so downstream
@@ -1144,6 +1182,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 requires_padding=requires_padding,
                 schedule_metadata=self.scheduler_metadata_buffer,
                 global_seq_lens=global_seq_lens_for_decode,
+                logits_width=decode_logits_width,
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(

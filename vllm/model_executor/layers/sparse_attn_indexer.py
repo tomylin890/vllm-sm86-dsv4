@@ -1020,6 +1020,19 @@ def sparse_attn_indexer(
             # `seq_lens`, so size the buffer to the active batch max rather
             # than the configured model max.
             active_max_model_len = attn_metadata_narrowed.max_seq_len
+            # The builder's logits_width is the same bound in the SPACE
+            # seq_lens actually lives in (compressed and/or DCP-localized);
+            # max_seq_len is global uncompressed tokens -- up to
+            # compress_ratio * dcp_world_size (16x here) wider than any row
+            # the top-k can read. Besides the wasted buffer, the inflated
+            # width is what the persistent-topk launch cap compares against
+            # (VLLM_SM86_PERSISTENT_TOPK_MAX_COLS), so an over-wide buffer
+            # can force the generic top-k on boots whose REAL width fits the
+            # persistent kernel. min() keeps this monotone-safe: never wider
+            # than the previous behavior.
+            _builder_width = decode_metadata.logits_width
+            if _builder_width > 0:
+                active_max_model_len = min(active_max_model_len, _builder_width)
             logits = fp8_paged_mqa_logits_triton(
                 padded_q_quant_cast,
                 kv_cache,
