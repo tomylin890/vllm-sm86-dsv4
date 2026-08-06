@@ -1673,10 +1673,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and loses when it is memory-bound -- so this is a knob, not a new
     # default; A/B it per machine. Values must be one of the kernel's
     # supported sizes (8/16/32/48/64); the int8-input >=16 clamp still
-    # applies after the override. Bit-exactness: block_size_m only
-    # partitions independent output rows, and both MoE GEMM launches pin
-    # use_atomic_add=False / use_fp32_reduce=True, so the k-loop stays a
-    # single sequential fp32 accumulation per output element.
+    # applies after the override. Numerics: default 0 is byte-for-byte
+    # upstream. A CHANGED block size is numerically near-neutral but NOT
+    # bit-exact -- moe_block_size feeds the stream-K work split
+    # (marlin_template.h: parallel -> iters -> slice_count), and when
+    # slice_count > 1 the fp32 partial-sum concatenation order in
+    # global_reduce_fp32 changes, which can flip a greedy token at a
+    # near-tie. A/B runs that change this value must gate on the needle
+    # grid / selected-index-set standard, not token equality. Note the
+    # override reaches only the contiguous fused_marlin_moe path; the
+    # batched (EP) expert path picks its block size independently.
     "VLLM_MARLIN_MOE_BLOCK_SIZE_M": lambda: int(
         os.getenv("VLLM_MARLIN_MOE_BLOCK_SIZE_M", "0")
     ),

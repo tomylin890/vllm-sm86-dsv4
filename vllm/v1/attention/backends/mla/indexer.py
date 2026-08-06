@@ -23,7 +23,7 @@ from vllm.utils.deep_gemm import (
     is_deep_gemm_supported,
 )
 from vllm.utils.platform_utils import num_compute_units
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -1119,10 +1119,18 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 )
                 seq_lens_buffer.copy_(local_compressed_seq_lens)
                 seq_lens = seq_lens_buffer
-                # seq_lens are now LOCAL COMPRESSED entries; the widest row is
-                # bounded by ceil(ceil(max_tokens / m) / world) (+1 covers the
-                # interleave remainder). Global inputs only -> rank-invariant.
-                decode_logits_width = (
+                # seq_lens are now LOCAL COMPRESSED entries; the widest row
+                # is bounded by ceil(ceil(max_tokens / m) / world) + 1 slack.
+                # Global inputs only -> rank-invariant. The bound is only
+                # valid at interleave 1 (the round-robin max for I > 1 is
+                # cdiv(E, W*I) * I, which can exceed this); the builder
+                # rejects I > 1 at init, and the assert keeps the formula
+                # from silently outliving that guard. round_up(16) keeps the
+                # row stride 4-float-aligned so the topk kernels' vec_size=4
+                # loads and Triton's divisibility hints survive -- an odd
+                # width would quietly de-vectorize three downstream paths.
+                assert self.cp_kv_cache_interleave_size == 1
+                decode_logits_width = round_up(
                     cdiv(
                         cdiv(
                             common_attn_metadata.max_seq_len,
@@ -1130,16 +1138,18 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                         ),
                         self.dcp_world_size,
                     )
-                    + 1
+                    + 1,
+                    16,
                 )
             elif dcp_local_seq_lens is not None:
                 seq_lens = self._dcp_localize_decode_seq_lens(
                     seq_lens, num_decodes, seq_lens_is_buffer_view
                 )
-                # LOCAL uncompressed tokens.
-                decode_logits_width = (
+                # LOCAL uncompressed tokens. Same alignment note as above.
+                decode_logits_width = round_up(
                     cdiv(common_attn_metadata.max_seq_len, self.dcp_world_size)
-                    + 1
+                    + 1,
+                    16,
                 )
             # For DeepseekV4 (compress_ratio > 1), the indexer KV cache stores
             # compressed tokens. Convert uncompressed seq_lens to compressed.
@@ -1156,9 +1166,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             if decode_logits_width < 0:
                 # No DCP localization happened above: seq_lens are GLOBAL,
-                # compressed iff compress_ratio > 1.
-                decode_logits_width = cdiv(
-                    common_attn_metadata.max_seq_len, self.compress_ratio
+                # compressed iff compress_ratio > 1. Same alignment note as
+                # the localized branches.
+                decode_logits_width = round_up(
+                    cdiv(common_attn_metadata.max_seq_len, self.compress_ratio),
+                    16,
                 )
 
             # Non-MTP: deep_gemm paged MQA logits requires 2D context_lens

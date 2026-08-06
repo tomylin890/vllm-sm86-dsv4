@@ -1023,9 +1023,15 @@ def _get_cached_wo_a_bf16(
         # a loud shape mismatch on the emptied tensors rather than silently
         # recomputing a stale cache -- fail-loud is intended.
         #
-        # Under VLLM_DSV4_WARMUP=1 the first forward happens during boot
-        # warmup, so in production the release lands at startup and the
-        # profiler's steady-state accounting sees the deduplicated layout.
+        # The first forward through this path is the memory profiler's
+        # profile_run at boot (before KV sizing; VLLM_DSV4_WARMUP's ladder
+        # comes later), so the release lands inside the profiling window
+        # either way. It is accounting-neutral there: the bf16 cache
+        # (larger) is allocated in the same call that frees the (smaller)
+        # fp8 original, so the allocation floor rises monotonically and
+        # peak-vs-end headroom is unchanged. The reclaimed bytes return to
+        # the usable pool under expandable_segments; without it they remain
+        # allocator-held OOM margin rather than KV budget.
         freed = wo_a.weight.numel() * wo_a.weight.element_size() + (
             wo_a.weight_scale_inv.numel() * wo_a.weight_scale_inv.element_size()
         )

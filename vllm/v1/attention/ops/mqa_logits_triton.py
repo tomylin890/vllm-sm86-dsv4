@@ -355,12 +355,15 @@ def _fp8_mqa_logits_kernel(
     # matmul for ALU/regs). Paged-decode keeps the LUT path.
     # Axis order is deliberate: n_block on program_id(0) makes consecutive
     # CTAs sweep K tiles for a FIXED query row, so the operand that must stay
-    # resident between reuses is the K span (a few MB per chunk once the
-    # budget is DCP-local -- fits GA102's 6 MB L2), and Q streams from HBM
-    # exactly once. The transposed order (m fastest) kept a single 16 KB
-    # K tile hot but re-streamed the full multi-MB Q block once per n_block
-    # -- gigabytes of redundant Q traffic per layer per step at long
-    # context. Same math, same store targets, only CTA dispatch order
+    # resident between reuses is the row's K band (DCP-local, L2-resident),
+    # and Q streams from HBM once. The transposed order (m fastest) kept a
+    # single K tile hot but re-streamed the whole Q block once per n_block.
+    # The win is where M is large enough that Q (M x 16 KB) spills L2 while
+    # the K band still fits: mid-length chunks (~16k-64k). At long context
+    # the logits-budget chunker shrinks M inversely with N (max_q =
+    # max_logits_elems // chunk_n), so Q re-fits L2 on its own and the swap
+    # converges to neutral -- benchmark this at 16k/64k, not only at the
+    # long points. Same math, same store targets, only CTA dispatch order
     # changes: every output element is still produced by one CTA with one
     # full-width tl.dot, so the swap is bit-identical.
     m = tl.program_id(1)
