@@ -1045,6 +1045,17 @@ def sparse_attn_indexer(
             1024,
             2048,
         )
+        # P13: GA102 launch-geometry ceiling. persistent_topk raises once
+        # its CTA count exceeds num_sms * occupancy (the sm86 smem budget
+        # rules out its FilteredTopK fallback), and FULL_DECODE_ONLY capture
+        # bakes this dispatch into the graph at the logits buffer's full
+        # max_model_len width -- so the decision has to be made against the
+        # buffer bound, not the live batch. Past the cap, fall through to
+        # ops.top_k_per_row_decode, which tiles to any length. Unset = 0 =
+        # upstream dispatch.
+        _pt_max_cols = envs.VLLM_SM86_PERSISTENT_TOPK_MAX_COLS
+        if _pt_max_cols > 0 and logits.shape[1] > _pt_max_cols:
+            use_persistent_topk = False
         if envs.VLLM_SM86_DET_TOPK:
             # P2e debug gate: deterministic selection replaces whichever of
             # the three decode kernels below would have run. They agree on

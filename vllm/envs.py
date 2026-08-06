@@ -125,6 +125,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_SM86_DCP: bool = False
     VLLM_SM86_DET_TOPK: bool = False
+    VLLM_SM86_PERSISTENT_TOPK_MAX_COLS: int = 0
     VLLM_DSV4_FLASH_PREFILL: bool = False
     VLLM_DSV4_FLASH_DECODE: bool = False
     VLLM_DSV4_FLASH_DECODE_SCRATCH_MB: int = 1024
@@ -1209,6 +1210,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # byte-for-byte unchanged when this is unset.
     "VLLM_SM86_DET_TOPK": lambda: (
         os.getenv("VLLM_SM86_DET_TOPK", "False").lower() in ("true", "1")
+    ),
+    # P13: widest logit-column bound the flash-mla persistent_topk decode
+    # kernel may be dispatched for. Its launcher refuses to launch once the
+    # CTA count exceeds num_sms * occupancy, and the FilteredTopK fallback
+    # inside the kernel wants 128 KB of shared memory per block -- more than
+    # sm86's 99 KB -- so on an 82-SM GA102 any bound past ~693k columns
+    # raises at launch instead of degrading. FULL_DECODE_ONLY capture runs
+    # the dispatch once with the logits buffer at max_model_len width and
+    # bakes the choice into the graph, which turns that raise into a boot
+    # failure for max_model_len above the ceiling (measured: 680000 boots,
+    # 1048576 does not). Set this to the highest bound the card can launch
+    # (680000 on 82-SM parts) and longer-context boots fall through to
+    # ops.top_k_per_row_decode, which tiles to any length. Default 0 = no
+    # cap = upstream dispatch, byte-for-byte.
+    "VLLM_SM86_PERSISTENT_TOPK_MAX_COLS": lambda: int(
+        os.getenv("VLLM_SM86_PERSISTENT_TOPK_MAX_COLS", "0")
     ),
     # P6: route the SM8x DSV4 DCP compressed-layer PREFILL attention through
     # the flash-mla fused sparse-prefill CUDA op (fwd_sparse_prefill_mla)
