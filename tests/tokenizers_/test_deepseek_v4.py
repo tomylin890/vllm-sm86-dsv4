@@ -76,16 +76,53 @@ def test_deepseek_v4_tokenizer_registered():
     )
 
 
-def test_deepseek_v4_defaults_to_thinking_with_high_effort():
+def test_deepseek_v4_thinking_is_opt_in_when_no_kwargs():
+    """No thinking key -> chat mode. DELIBERATE DIVERGENCE from upstream.
+
+    Upstream #50580 made a request carrying neither `thinking` nor
+    `enable_thinking` default to thinking mode here. The reasoning parser
+    derives the same decision independently (vllm/parser/deepseek_v4.py reads
+    `chat_template_kwargs`) and was not changed with it, so the two disagree
+    for exactly those requests: this renderer primes the prompt with
+    `<think>`, the parser starts in CONTENT, and the model's closing
+    `</think>` hits the (CONTENT, THINK_END) transition that absorbs it
+    without emitting REASONING_END -- the reasoning is generated, never
+    routed, and is served as the answer.
+
+    Verified on the 8x3090 deployment: a request with no chat_template_kwargs
+    came back with 78 characters of deliberation in `content` and an empty
+    `reasoning`, byte-for-byte the text that the same request returns under
+    `reasoning` when thinking=true is passed.
+
+    Keeping thinking opt-in makes both sides agree on every input. A
+    deployment that wants thinking by default states it explicitly
+    (--default-chat-template-kwargs '{"thinking":true}'), which the parser
+    can see too. If a future upstream merge re-flips this default, this test
+    fails -- and the parser must be flipped in the same commit.
+    """
     prompt = _tokenizer().apply_chat_template(
         [{"role": "user", "content": "Hello"}],
         tokenize=False,
     )
 
-    assert prompt.startswith(
-        "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"
+    assert "Reasoning Effort:" not in prompt
+    assert prompt.endswith("<｜Assistant｜></think>")
+
+
+def test_deepseek_v4_explicit_thinking_flags_still_work():
+    """The shapes our clients actually send: both are honoured, and both
+    agree with the parser's own reading of the same kwargs."""
+    on = _tokenizer().apply_chat_template(
+        [{"role": "user", "content": "Hello"}], tokenize=False, thinking=True
     )
-    assert prompt.endswith("<｜Assistant｜><think>")
+    assert on.endswith("<｜Assistant｜><think>")
+    assert on.startswith("<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum")
+
+    off = _tokenizer().apply_chat_template(
+        [{"role": "user", "content": "Hello"}], tokenize=False, thinking=False
+    )
+    assert off.endswith("<｜Assistant｜></think>")
+    assert "Reasoning Effort:" not in off
 
 
 @pytest.mark.parametrize("kwargs", [{"thinking": True}, {"enable_thinking": True}])
@@ -133,6 +170,11 @@ def test_deepseek_v4_uses_v4_tool_prompt_from_request_tools():
         [{"role": "user", "content": "Weather?"}],
         tools=tools,
         tokenize=False,
+        # Explicit: thinking is opt-in on this fork (see
+        # test_deepseek_v4_thinking_is_opt_in_when_no_kwargs), so the effort
+        # prefix and the `<think>` ending this test also checks require the
+        # flag. The subject of the test -- the V4 tool prompt -- is unchanged.
+        thinking=True,
     )
 
     assert "## Tools" in prompt

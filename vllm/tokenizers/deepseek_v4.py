@@ -31,9 +31,29 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
         ) -> str | list[int]:
             thinking = kwargs.get("thinking")
             enable_thinking = kwargs.get("enable_thinking")
+            # Thinking stays OPT-IN. Upstream #50580 flipped the no-key
+            # default to enabled here, but the reasoning parser derives the
+            # same decision independently -- from
+            # `chat_template_kwargs.get("thinking")` in
+            # vllm/parser/deepseek_v4.py -- and was not flipped with it. The
+            # two then disagree for exactly the requests that carry neither
+            # key: this side renders thinking mode and primes the prompt with
+            # `<think>`, while the parser starts in CONTENT, where the model's
+            # closing `</think>` hits the (CONTENT, THINK_END) transition that
+            # absorbs it without emitting REASONING_END. The reasoning is
+            # produced, is never routed, and lands in `content` -- verified on
+            # the 8x3090 deployment: a request with no chat_template_kwargs
+            # returned 78 characters of deliberation as its answer while
+            # `reasoning` came back empty, byte-for-byte the text the same
+            # request returns under `reasoning` when thinking=true is passed.
+            #
+            # Keeping opt-in makes the two sides agree again for every input.
+            # Deployments that want thinking by default should say so
+            # explicitly (--default-chat-template-kwargs '{"thinking":true}'),
+            # which both this renderer and the parser can see. The rest of
+            # #50580 -- the low/high/max effort table and the "high" default
+            # for requests that DO enable thinking -- is kept.
             thinking_enabled = bool(thinking) or bool(enable_thinking)
-            if "thinking" not in kwargs and "enable_thinking" not in kwargs:
-                thinking_enabled = True
             thinking_mode = "thinking" if thinking_enabled else "chat"
 
             conversation = kwargs.get("conversation", messages)
