@@ -315,3 +315,64 @@ def test_deepseek_v4_matches_reference_golden_fixtures(case_id, kwargs):
 
     expected = (FIXTURES_DIR / f"test_output_{case_id}.txt").read_text()
     assert prompt == expected
+
+
+def test_history_without_reasoning_renders_no_empty_think_block():
+    """A history assistant turn whose reasoning was not echoed back must render
+    the no-thinking form (a bare closer), never an empty ``<think></think>``.
+
+    The opener comes from the preceding message's transition and the closer
+    from the assistant message, so an unguarded pair produces a turn that
+    "opened thinking and wrote nothing" -- an in-context demonstration
+    DeepSeek-V4 imitates, emitting ``</think>`` as its first token on the next
+    turn (answer lands in content, reasoning comes back empty). Stock
+    OpenAI-compatible clients never echo ``reasoning``, so this is the default
+    shape of every multi-turn tool conversation.
+    """
+    from vllm.tokenizers.deepseek_v4_encoding import encode_messages
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            },
+        }
+    ]
+    tool_call = {
+        "id": "c1",
+        "type": "function",
+        "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'},
+    }
+
+    def convo(reasoning: str | None):
+        assistant = {"role": "assistant", "content": "", "tool_calls": [tool_call]}
+        if reasoning is not None:
+            assistant["reasoning"] = reasoning
+        return [
+            {"role": "system", "content": "agent", "tools": tools},
+            {"role": "user", "content": "read it"},
+            assistant,
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            {"role": "user", "content": "summarize"},
+        ]
+
+    without = encode_messages(convo(None), thinking_mode="thinking")
+    assert "<think></think>" not in without
+    assert "</think></think>" not in without
+    # The no-thinking form: assistant turn opens with a bare closer.
+    assert "<｜Assistant｜></think>" in without
+    # The live generation position still primes thinking.
+    assert without.endswith("<think>")
+
+    # Supplied reasoning is preserved verbatim inside a real block.
+    with_reasoning = encode_messages(convo("plan it"), thinking_mode="thinking")
+    assert "<think>plan it</think>" in with_reasoning
+    assert "<think></think>" not in with_reasoning
+    assert with_reasoning.endswith("<think>")

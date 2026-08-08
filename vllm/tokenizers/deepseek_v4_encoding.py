@@ -185,6 +185,37 @@ def render_tools(tools: List[Dict[str, Union[str, Dict[str, Any]]]]) -> str:
     )
 
 
+def next_assistant_has_reasoning(index: int, messages: List[Dict[str, Any]]) -> bool:
+    """Whether the assistant message right after `index` carries reasoning text.
+
+    The `<think>` that opens a turn is emitted by the PRECEDING message's
+    transition, while the matching `</think>` is emitted by the assistant
+    message itself. When a client does not echo `reasoning` back -- which is
+    every stock OpenAI-compatible client, since the field is not part of the
+    OpenAI request schema -- the two halves combine into a bare
+    `<think></think>`: a turn that opened thinking and wrote nothing.
+
+    That is not the model's "did not think" form. The no-thinking form this
+    encoding already uses elsewhere is a bare `</think>` with no opener. The
+    empty-block form is a demonstration, sitting in-context, of opening and
+    immediately closing a thinking block -- and DeepSeek-V4 imitates it: with
+    two such turns in the history of a tool loop, the model emits `</think>`
+    as its first token on the next turn, so its answer (planning included)
+    lands in `content` and `reasoning` comes back empty.
+
+    Callers use this to pick the no-thinking rendering for history turns whose
+    reasoning was not supplied, keeping the context free of that example.
+    """
+    nxt = index + 1
+    if nxt >= len(messages):
+        return False
+    msg = messages[nxt]
+    if msg.get("role") != "assistant":
+        return False
+    reasoning = msg.get("reasoning") or msg.get("reasoning_content")
+    return bool(reasoning and str(reasoning).strip())
+
+
 def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
     """Find the index of the last user/developer message."""
     last_user_index = -1
@@ -326,7 +357,24 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
 
         if thinking_mode == "thinking" and not prev_has_task:
             if not drop_thinking or index > last_user_idx:
-                thinking_part = thinking_template.format(reasoning=reasoning) + thinking_end_token
+                # Only render a thinking block when there is reasoning to put
+                # in it. With reasoning absent (client did not echo it) the
+                # opener from the previous transition plus this closer would
+                # form `<think></think>` -- see next_assistant_has_reasoning.
+                # Emitting the closer alone matches the no-thinking form used
+                # by the drop_thinking path, and the transition suppresses its
+                # opener for exactly these turns.
+                if reasoning.strip():
+                    thinking_part = (
+                        thinking_template.format(reasoning=reasoning)
+                        + thinking_end_token
+                    )
+                else:
+                    # Nothing here: the preceding transition already emitted
+                    # the bare closer for this turn, which IS the no-thinking
+                    # form (identical to what the drop_thinking path renders).
+                    # Emitting one here too would double it.
+                    thinking_part = ""
             else:
                 thinking_part = ""
 
@@ -367,7 +415,20 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
     elif messages[index].get("role") in ["user", "developer"]:
         # Normal generation: append Assistant + thinking token
         prompt += ASSISTANT_SP_TOKEN
-        if not drop_thinking and thinking_mode == "thinking":
+        # A HISTORY turn (one an assistant message already follows) whose
+        # reasoning was not supplied must not get an opener: its closer is
+        # rendered unconditionally by the assistant branch, and the pair would
+        # become an empty `<think></think>` the model then imitates. The LIVE
+        # generation position -- no assistant message follows it -- always
+        # gets the opener, so thinking is still primed for the current turn.
+        history_turn_without_reasoning = (
+            index + 1 < len(messages)
+            and messages[index + 1].get("role") == "assistant"
+            and not next_assistant_has_reasoning(index, messages)
+        )
+        if thinking_mode == "thinking" and history_turn_without_reasoning:
+            prompt += thinking_end_token
+        elif not drop_thinking and thinking_mode == "thinking":
             prompt += thinking_start_token
         elif drop_thinking and thinking_mode == "thinking" and index >= last_user_idx:
             prompt += thinking_start_token
