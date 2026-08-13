@@ -79,6 +79,7 @@ def _group_tokens_per_block(spec: KVCacheSpec, dcp_size: int) -> int:
 def build_offloading_config(
     vllm_config: "VllmConfig",
     kv_cache_config: "KVCacheConfig",
+    is_worker: bool = True,
 ) -> OffloadingConfig:
     """Translate vLLM configuration into the native offloading boundary."""
     kv_transfer_config = vllm_config.kv_transfer_config
@@ -174,7 +175,12 @@ def build_offloading_config(
     )
     if override is not None and worker_kv_bytes_per_block > 0:
         override = int(override)
-        if override < worker_kv_bytes_per_block:
+        # The floor only binds WORKER processes: a worker slot shorter than
+        # its real KV bytes overflows into the neighboring worker's slot. The
+        # scheduler computes its value from the WHOLE model (all PP stages
+        # summed), does not own a slot, and only needs the region geometry --
+        # it adopts the override as-is.
+        if is_worker and override < worker_kv_bytes_per_block:
             raise ValueError(
                 f"worker_kv_bytes_per_block_override={override} is smaller "
                 f"than this process's computed value "

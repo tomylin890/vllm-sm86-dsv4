@@ -65,7 +65,9 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     ):
         super().__init__(vllm_config, role, kv_cache_config)
 
-        offloading_config = build_offloading_config(vllm_config, kv_cache_config)
+        offloading_config = build_offloading_config(
+            vllm_config, kv_cache_config, is_worker=(role == KVConnectorRole.WORKER)
+        )
         spec = OffloadingSpecFactory.create_spec(offloading_config)
 
         self.connector_scheduler: OffloadingConnectorScheduler | None = None
