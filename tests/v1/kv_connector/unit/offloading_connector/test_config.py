@@ -641,3 +641,142 @@ def test_blocks_per_chunk_must_be_positive():
 
     with pytest.raises(ValueError, match="greater than 0"):
         build_offloading_config(config, _make_kv_cache_config())
+
+
+# ---------------------------------------------------------------------------
+# DSV4-shaped five-group configs under VLLM_SM86_DCP + dcp=4.
+# ---------------------------------------------------------------------------
+
+
+def _dsv4_specs() -> dict[str, Any]:
+    """The five DSV4 group spec shapes: 1 sharded MLA + 4 dcp_exempt.
+
+    Block sizes mirror the production deployment (256 for the compressed MLA
+    group; 64/8/4/4 for the SWA-KV and fp32 compressor-state groups), which
+    is also the shape whose gated GCD (=4) the resolve_kv_cache_block_sizes
+    comment documents.
+    """
+    return {
+        "mla": _mla_spec(block_size=256),
+        "swa": SlidingWindowSpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=torch.float16,
+            sliding_window=4096,
+        ),
+        "state_a": SlidingWindowMLASpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.float32,
+            sliding_window=128,
+        ),
+        "state_b": SlidingWindowMLASpec(
+            block_size=4,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.float32,
+            sliding_window=8,
+        ),
+        "swa2": SlidingWindowSpec(
+            block_size=4,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=torch.float16,
+            sliding_window=512,
+        ),
+    }
+
+
+def _five_group_config(*, wrapped: bool) -> KVCacheConfig:
+    """Scheduler-side (unwrapped per-layer specs) or worker-side (each group
+    arrives as a UniformTypeKVCacheSpecs wrapper) shape of the same model."""
+    specs = _dsv4_specs()
+    groups = []
+    for name, spec in specs.items():
+        if wrapped:
+            spec = UniformTypeKVCacheSpecs(
+                block_size=spec.block_size,
+                kv_cache_specs={f"{name}_layer": spec},
+            )
+        groups.append(KVCacheGroupSpec([f"{name}_layer"], spec))
+    num_blocks = 16
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(size=num_blocks * 64, shared_by=[f"{n}_layer"], block_stride=0)
+            for n in specs
+        ],
+        kv_cache_groups=groups,
+    )
+
+
+# What one logical block of each group actually covers at dcp=4: the sharded
+# MLA group spans block_size * dcp tokens of the sequence; the four
+# dcp_exempt (replicated) groups span exactly block_size tokens.
+_DSV4_EXPECTED_TOKENS_PER_BLOCK = {
+    "mla_layer": 256 * 4,
+    "swa_layer": 64,
+    "state_a_layer": 8,
+    "state_b_layer": 4,
+    "swa2_layer": 4,
+}
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["scheduler_side", "worker_side"])
+def test_dsv4_five_groups_dcp_exempt_tokens_per_block(
+    monkeypatch: pytest.MonkeyPatch, wrapped: bool
+) -> None:
+    """dcp_exempt groups must NOT be scaled by dcp -- on either side.
+
+    Failure modes this pins down (both present before the fix):
+    - scheduler side (unwrapped): every spec is an AttentionSpec, so the
+      exempt SWA/compressor-state groups were scaled 4x. The oversized
+      tokens_per_block makes a stored chunk claim tokens it does not hold;
+      the restore shortfall lands on the tail blocks of the sliding window
+      and BOTH sides of the scheduler's window-size check shrink together,
+      so the result is silently wrong output, not an assert.
+    - worker side (wrapped): UniformTypeKVCacheSpecs is not an AttentionSpec,
+      so NO group was scaled -- including the genuinely sharded MLA group --
+      and the two sides of the same engine disagreed on every group.
+    """
+    monkeypatch.setenv("VLLM_SM86_DCP", "1")
+    vllm_config = _make_vllm_config(
+        extra_config={"blocks_per_chunk": 1},
+        tensor_parallel_size=4,
+        decode_context_parallel_size=4,
+    )
+    config = build_offloading_config(
+        vllm_config, _five_group_config(wrapped=wrapped)
+    )
+    got = {
+        group.layer_names[0]: group.tokens_per_block for group in config.groups
+    }
+    assert got == _DSV4_EXPECTED_TOKENS_PER_BLOCK
+
+
+def test_dsv4_five_groups_without_sm86_dcp_keeps_upstream_scaling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without VLLM_SM86_DCP the exempt predicate is inert: plain upstream
+    behavior (every unwrapped attention group scaled by dcp) is preserved."""
+    monkeypatch.delenv("VLLM_SM86_DCP", raising=False)
+    vllm_config = _make_vllm_config(
+        extra_config={"blocks_per_chunk": 1},
+        tensor_parallel_size=4,
+        decode_context_parallel_size=4,
+    )
+    config = build_offloading_config(
+        vllm_config, _five_group_config(wrapped=False)
+    )
+    got = {
+        group.layer_names[0]: group.tokens_per_block for group in config.groups
+    }
+    assert got == {
+        "mla_layer": 1024,
+        "swa_layer": 256,
+        "state_a_layer": 32,
+        "state_b_layer": 16,
+        "swa2_layer": 16,
+    }

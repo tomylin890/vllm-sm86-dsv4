@@ -4,11 +4,17 @@
 
 from typing import TYPE_CHECKING
 
-from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+from vllm.v1.core.kv_cache_utils import (
+    is_dcp_exempt_spec,
+    resolve_kv_cache_block_sizes,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
+    KVCacheSpec,
+    KVCacheSpecKind,
     MLAAttentionSpec,
+    get_kv_cache_spec_kind,
 )
 from vllm.v1.kv_offload.config import (
     OffloadingCacheConfig,
@@ -28,6 +34,40 @@ def is_kv_cache_tensor_packed(kv_cache_tensor: "KVCacheTensor") -> bool:
     return bool(kv_cache_tensor.block_stride)
 
 
+def _group_tokens_per_block(spec: KVCacheSpec, dcp_size: int) -> int:
+    """Tokens covered by one logical block of a KV cache group.
+
+    Mirrors `resolve_kv_cache_block_sizes`: a DCP-sharded attention group's
+    block covers ``block_size * dcp`` tokens of the sequence (each rank holds
+    every dcp-th token), while a `is_dcp_exempt_spec` group is REPLICATED --
+    every rank holds all of its tokens -- so one block covers only
+    ``block_size`` tokens. Scaling an exempt group by dcp overstates the
+    tokens a stored chunk can serve; on restore the shortfall lands on the
+    TAIL blocks of the sliding window -- exactly the positions the next token
+    attends to -- and both sides of the scheduler's sliding-window size check
+    shrink together, so nothing asserts: the failure mode is silently wrong
+    output, not a crash.
+
+    The attention check is kind-based rather than `isinstance(AttentionSpec)`
+    because the two callers see different shapes: the scheduler receives
+    per-layer specs (unwrapped by `generate_scheduler_kv_cache_config`), the
+    worker receives `UniformTypeKVCacheSpecs` wrappers, which are NOT
+    AttentionSpec subclasses. Under the isinstance check the worker side
+    silently skipped the dcp factor for every group, sharded ones included.
+    `get_kv_cache_spec_kind` recurses the wrapper, so both sides now agree.
+    The plain-isinstance term keeps upstream behavior for any AttentionSpec
+    subclass the kind table does not know.
+    """
+    kind = get_kv_cache_spec_kind(spec)
+    is_attention = isinstance(spec, AttentionSpec) or kind not in (
+        KVCacheSpecKind.MAMBA,
+        KVCacheSpecKind.UNKNOWN,
+    )
+    if is_attention and not is_dcp_exempt_spec(spec):
+        return spec.block_size * dcp_size
+    return spec.block_size
+
+
 def build_offloading_config(
     vllm_config: "VllmConfig",
     kv_cache_config: "KVCacheConfig",
@@ -42,13 +82,9 @@ def build_offloading_config(
     parallel_config = vllm_config.parallel_config
     groups = tuple(
         OffloadingGroupConfig(
-            tokens_per_block=(
-                group.kv_cache_spec.block_size
-                * (
-                    parallel_config.decode_context_parallel_size
-                    if isinstance(group.kv_cache_spec, AttentionSpec)
-                    else 1
-                )
+            tokens_per_block=_group_tokens_per_block(
+                group.kv_cache_spec,
+                parallel_config.decode_context_parallel_size,
             ),
             layer_names=tuple(group.layer_names),
         )
