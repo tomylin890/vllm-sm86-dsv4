@@ -173,13 +173,22 @@ class AsyncLookupManager(ABC):
                     # A key is enqueued for probing exactly once, so a decided
                     # verdict must never receive a second result. Enforcing it
                     # keeps a late/duplicate result from resurrecting a stale
-                    # True and reopening the failed-load livelock.
+                    # True and reopening the failed-load livelock. cleanup()
+                    # upholds the invariant from the other side: it never
+                    # deletes an in-flight entry, so a later lookup() finds it
+                    # and does not re-enqueue the key.
                     assert state.result is None, (
                         "cached key received a second lookup result; the "
                         "enqueue-once invariant is broken and could reopen the "
                         "failed-load livelock"
                     )
                     state.result = result
+                    # Deferred cleanup: the last referencing request finished
+                    # while this probe was still in flight (cleanup() kept the
+                    # entry alive to protect the enqueue-once invariant). Now
+                    # that the verdict has landed nobody will consume it.
+                    if not state.request_ids:
+                        del self._lookup_state[key]
 
     def mark_miss(self, keys: Collection[OffloadKey]) -> None:
         """Force the cached verdict for ``keys`` to False after a failed load, so
@@ -187,7 +196,12 @@ class AsyncLookupManager(ABC):
         Keys with no cached entry are skipped."""
         for key in keys:
             state = self._lookup_state.get(key)
-            if state is not None:
+            # Only demote DECIDED verdicts. A load can only have been issued
+            # for a key whose verdict was True, so an undecided entry here
+            # means the key is still being probed -- writing False now would
+            # collide with the probe's own result in drain_results() (the
+            # enqueue-once assert), and the probe's verdict is fresher anyway.
+            if state is not None and state.result is not None:
                 state.result = False
 
     def cleanup(self, req_id: str) -> None:
@@ -199,7 +213,17 @@ class AsyncLookupManager(ABC):
         for key in self._req_keys.pop(req_id, ()):
             state = self._lookup_state[key]
             state.request_ids.discard(req_id)
-            if not state.request_ids:
+            # Only delete DECIDED entries. An in-flight probe (result is None)
+            # may already sit in _lookup_batch or in the worker queue; deleting
+            # its state here would let a later lookup() for the same key
+            # re-enqueue it, and the two results would then trip the
+            # enqueue-once assert in drain_results() -- an engine-killing race
+            # that needs nothing more exotic than a request finishing in the
+            # same step that scheduled its probe, plus a second request
+            # arriving before the probe lands (slow SSD, large batch).
+            # In-flight entries are removed by drain_results() when their
+            # verdict arrives and no request references them anymore.
+            if not state.request_ids and state.result is not None:
                 del self._lookup_state[key]
 
     def shutdown(self) -> None:

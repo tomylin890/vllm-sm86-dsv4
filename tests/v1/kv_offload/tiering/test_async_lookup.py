@@ -3,6 +3,7 @@
 """Unit tests for AsyncLookupManager."""
 
 import threading
+import time
 from collections.abc import Iterable
 
 import pytest
@@ -223,4 +224,114 @@ class TestAsyncLookupManager:
         mgr._pending_results.put([(_key(1), True)])
         with pytest.raises(AssertionError):
             mgr.drain_results()
+        mgr.shutdown()
+
+
+class BlockingLookupManager(AsyncLookupManager):
+    """Worker blocks until released -- keeps a probe deterministically
+    in flight so tests can interleave cleanup()/lookup() around it."""
+
+    def __init__(self, existing_keys: set[OffloadKey] | None = None):
+        super().__init__(tier_type="test")
+        self._existing = existing_keys or set()
+        self.release = threading.Event()
+        self.entered = threading.Event()
+        self._results_ready = threading.Event()
+
+    def batch_lookup(
+        self, keys: list[OffloadKey], req_context: ReqContext
+    ) -> Iterable[bool]:
+        self.entered.set()
+        self.release.wait()
+        results = [k in self._existing for k in keys]
+        self._results_ready.set()
+        return results
+
+
+class TestInflightCleanupRace:
+    def test_inflight_probe_survives_cleanup_no_reenqueue(self):
+        """Engine-killing race regression: a request finishing in the same
+        step that scheduled its probe must NOT let a later request re-enqueue
+        the key. Pre-fix, cleanup() deleted the in-flight state, the second
+        lookup re-enqueued, and the two results tripped the enqueue-once
+        assert in drain_results() -- an AssertionError out of
+        get_num_new_matched_tokens. All it takes is a slow SSD probe."""
+        mgr = BlockingLookupManager(existing_keys={_key(1)})
+        assert mgr.lookup(_key(1), _ctx("req_a")) is None
+        mgr.flush()
+        mgr.entered.wait()  # probe is now in flight (worker blocked)
+
+        # req_a finishes while the probe is still in flight.
+        mgr.cleanup("req_a")
+        assert _key(1) in mgr._lookup_state  # entry kept alive
+
+        # A second request for the same key must find the entry and NOT
+        # re-enqueue -- pre-fix this appended a duplicate probe.
+        assert mgr.lookup(_key(1), _ctx("req_b")) is None
+        assert mgr._lookup_batch == []
+
+        # Probe lands; the single verdict applies cleanly (no assert).
+        # Drain explicitly with a retry loop: _results_ready is set inside
+        # batch_lookup BEFORE the worker posts to _pending_results, and the
+        # earlier lookup() consumed this step's _need_to_drain flag.
+        mgr.release.set()
+        mgr._results_ready.wait()
+        result = None
+        for _ in range(100):
+            mgr.drain_results()
+            result = mgr.lookup(_key(1), _ctx("req_b"))
+            if result is not None:
+                break
+            time.sleep(0.01)
+        assert result is True
+
+        mgr.cleanup("req_b")
+        assert _key(1) not in mgr._lookup_state
+        mgr.shutdown()
+
+    def test_orphaned_inflight_entry_deleted_on_drain(self):
+        """If the last referencing request finished while the probe was in
+        flight, the entry is removed by drain_results() when the verdict
+        lands (deferred cleanup) -- kept-alive entries must not leak."""
+        mgr = BlockingLookupManager(existing_keys={_key(1)})
+        assert mgr.lookup(_key(1), _ctx("req_a")) is None
+        mgr.flush()
+        mgr.entered.wait()
+        mgr.cleanup("req_a")
+        assert _key(1) in mgr._lookup_state
+
+        mgr.release.set()
+        mgr._results_ready.wait()
+        # Give the worker time to post, then drain directly.
+        for _ in range(100):
+            mgr.drain_results()
+            if _key(1) not in mgr._lookup_state:
+                break
+            time.sleep(0.01)
+        assert _key(1) not in mgr._lookup_state
+        mgr.shutdown()
+
+    def test_mark_miss_skips_undecided_inflight_entry(self):
+        """mark_miss() must not decide an in-flight entry: the probe's own
+        result would then be a second write and trip the enqueue-once
+        assert. Loads are only issued for decided-True keys, so skipping
+        undecided entries loses nothing."""
+        mgr = BlockingLookupManager(existing_keys={_key(1)})
+        assert mgr.lookup(_key(1), _ctx("req_a")) is None
+        mgr.flush()
+        mgr.entered.wait()
+
+        mgr.mark_miss([_key(1)])  # in flight: must be a no-op
+        assert mgr._lookup_state[_key(1)].result is None
+
+        mgr.release.set()
+        mgr._results_ready.wait()
+        result = None
+        for _ in range(100):
+            mgr.drain_results()
+            result = mgr.lookup(_key(1), _ctx("req_a"))
+            if result is not None:
+                break
+            time.sleep(0.01)
+        assert result is True  # no assert trip
         mgr.shutdown()

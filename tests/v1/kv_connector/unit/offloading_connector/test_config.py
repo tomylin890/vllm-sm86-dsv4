@@ -651,40 +651,43 @@ def test_blocks_per_chunk_must_be_positive():
 def _dsv4_specs() -> dict[str, Any]:
     """The five DSV4 group spec shapes: 1 sharded MLA + 4 dcp_exempt.
 
-    Block sizes mirror the production deployment (256 for the compressed MLA
-    group; 64/8/4/4 for the SWA-KV and fp32 compressor-state groups), which
-    is also the shape whose gated GCD (=4) the resolve_kv_cache_block_sizes
-    comment documents.
+    Mirrors the real production grouping (1x compressed-MLA block 256; the
+    SWA-KV pair split into two identical SlidingWindowMLASpec groups block 64
+    / window 128; the C4 fp32 compressor-state group block 4 / window 8; the
+    C128 state group block 8 / window 128 -- all four exempt groups are
+    SlidingWindowMLASpec, DSV4 produces no plain SlidingWindowSpec). The
+    gated GCD of these block sizes is 4, the value the
+    resolve_kv_cache_block_sizes comment documents for dcp=4.
     """
     return {
         "mla": _mla_spec(block_size=256),
-        "swa": SlidingWindowSpec(
+        "swa_a": SlidingWindowMLASpec(
             block_size=64,
             num_kv_heads=1,
-            head_size=64,
-            dtype=torch.float16,
-            sliding_window=4096,
-        ),
-        "state_a": SlidingWindowMLASpec(
-            block_size=8,
-            num_kv_heads=1,
             head_size=512,
-            dtype=torch.float32,
+            dtype=torch.float16,
             sliding_window=128,
         ),
-        "state_b": SlidingWindowMLASpec(
+        "swa_b": SlidingWindowMLASpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.float16,
+            sliding_window=128,
+        ),
+        "state_c4": SlidingWindowMLASpec(
             block_size=4,
             num_kv_heads=1,
             head_size=512,
             dtype=torch.float32,
             sliding_window=8,
         ),
-        "swa2": SlidingWindowSpec(
-            block_size=4,
+        "state_c128": SlidingWindowMLASpec(
+            block_size=8,
             num_kv_heads=1,
-            head_size=64,
-            dtype=torch.float16,
-            sliding_window=512,
+            head_size=512,
+            dtype=torch.float32,
+            sliding_window=128,
         ),
     }
 
@@ -717,10 +720,10 @@ def _five_group_config(*, wrapped: bool) -> KVCacheConfig:
 # dcp_exempt (replicated) groups span exactly block_size tokens.
 _DSV4_EXPECTED_TOKENS_PER_BLOCK = {
     "mla_layer": 256 * 4,
-    "swa_layer": 64,
-    "state_a_layer": 8,
-    "state_b_layer": 4,
-    "swa2_layer": 4,
+    "swa_a_layer": 64,
+    "swa_b_layer": 64,
+    "state_c4_layer": 4,
+    "state_c128_layer": 8,
 }
 
 
@@ -732,11 +735,12 @@ def test_dsv4_five_groups_dcp_exempt_tokens_per_block(
 
     Failure modes this pins down (both present before the fix):
     - scheduler side (unwrapped): every spec is an AttentionSpec, so the
-      exempt SWA/compressor-state groups were scaled 4x. The oversized
-      tokens_per_block makes a stored chunk claim tokens it does not hold;
-      the restore shortfall lands on the tail blocks of the sliding window
-      and BOTH sides of the scheduler's window-size check shrink together,
-      so the result is silently wrong output, not an assert.
+      exempt SWA/compressor-state groups were scaled 4x. With
+      tokens_per_block=256 for a block-64 group, the restore slice
+      group_blocks[:num_gpu_blocks] is dominated by null blocks: the SWA
+      group's external load became a silent no-op while the scheduler had
+      already declared those tokens externally computed -- silently wrong
+      output, no assert.
     - worker side (wrapped): UniformTypeKVCacheSpecs is not an AttentionSpec,
       so NO group was scaled -- including the genuinely sharded MLA group --
       and the two sides of the same engine disagreed on every group.
@@ -756,11 +760,19 @@ def test_dsv4_five_groups_dcp_exempt_tokens_per_block(
     assert got == _DSV4_EXPECTED_TOKENS_PER_BLOCK
 
 
-def test_dsv4_five_groups_without_sm86_dcp_keeps_upstream_scaling(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("wrapped", [False, True], ids=["scheduler_side", "worker_side"])
+def test_dsv4_five_groups_without_sm86_dcp_scales_all_attention(
+    monkeypatch: pytest.MonkeyPatch, wrapped: bool
 ) -> None:
-    """Without VLLM_SM86_DCP the exempt predicate is inert: plain upstream
-    behavior (every unwrapped attention group scaled by dcp) is preserved."""
+    """Without VLLM_SM86_DCP the exempt predicate is inert and every
+    attention group is scaled by dcp -- NOW ON BOTH SIDES.
+
+    The unwrapped case pins unchanged upstream behavior. The wrapped case
+    pins an intentional behavior change: upstream's isinstance check skipped
+    the dcp factor for every wrapper, leaving worker and scheduler disagreed
+    for any dcp>1 hybrid model; wrappers now resolve through
+    get_kv_cache_spec_kind and scale like their members.
+    """
     monkeypatch.delenv("VLLM_SM86_DCP", raising=False)
     vllm_config = _make_vllm_config(
         extra_config={"blocks_per_chunk": 1},
@@ -768,15 +780,15 @@ def test_dsv4_five_groups_without_sm86_dcp_keeps_upstream_scaling(
         decode_context_parallel_size=4,
     )
     config = build_offloading_config(
-        vllm_config, _five_group_config(wrapped=False)
+        vllm_config, _five_group_config(wrapped=wrapped)
     )
     got = {
         group.layer_names[0]: group.tokens_per_block for group in config.groups
     }
     assert got == {
         "mla_layer": 1024,
-        "swa_layer": 256,
-        "state_a_layer": 32,
-        "state_b_layer": 16,
-        "swa2_layer": 16,
+        "swa_a_layer": 256,
+        "swa_b_layer": 256,
+        "state_c4_layer": 16,
+        "state_c128_layer": 32,
     }
