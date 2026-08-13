@@ -4,6 +4,8 @@
 
 from typing import TYPE_CHECKING
 
+from vllm.logger import init_logger
+
 from vllm.v1.core.kv_cache_utils import (
     is_dcp_exempt_spec,
     resolve_kv_cache_block_sizes,
@@ -14,6 +16,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     KVCacheSpecKind,
     MLAAttentionSpec,
+    UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
 from vllm.v1.kv_offload.config import (
@@ -27,6 +30,8 @@ from vllm.v1.kv_offload.config import (
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
+
+logger = init_logger(__name__)
 
 
 def is_kv_cache_tensor_packed(kv_cache_tensor: "KVCacheTensor") -> bool:
@@ -48,21 +53,24 @@ def _group_tokens_per_block(spec: KVCacheSpec, dcp_size: int) -> int:
     shrink together, so nothing asserts: the failure mode is silently wrong
     output, not a crash.
 
-    The attention check is kind-based rather than `isinstance(AttentionSpec)`
-    because the two callers see different shapes: the scheduler receives
-    per-layer specs (unwrapped by `generate_scheduler_kv_cache_config`), the
-    worker receives `UniformTypeKVCacheSpecs` wrappers, which are NOT
-    AttentionSpec subclasses. Under the isinstance check the worker side
-    silently skipped the dcp factor for every group, sharded ones included.
-    `get_kv_cache_spec_kind` recurses the wrapper, so both sides now agree.
-    The plain-isinstance term keeps upstream behavior for any AttentionSpec
-    subclass the kind table does not know.
+    The attention check must work for the two shapes the two callers see:
+    the scheduler receives per-layer specs (unwrapped by
+    `generate_scheduler_kv_cache_config`), the worker receives
+    `UniformTypeKVCacheSpecs` wrappers, which are NOT AttentionSpec
+    subclasses. Under a plain isinstance check the worker side silently
+    skipped the dcp factor for every group, sharded ones included. Wrappers
+    therefore resolve via `get_kv_cache_spec_kind` (which recurses them);
+    anything a wrapper can legally hold is attention-backed except Mamba
+    (`is_uniform_with_collection` forbids mixing Mamba with attention), so a
+    wrapper is attention iff its kind is not MAMBA -- including the UNKNOWN
+    kind a mixed-attention-kind wrapper resolves to, whose members the
+    scheduler would individually classify as attention. Plain specs keep the
+    upstream isinstance semantics exactly.
     """
-    kind = get_kv_cache_spec_kind(spec)
-    is_attention = isinstance(spec, AttentionSpec) or kind not in (
-        KVCacheSpecKind.MAMBA,
-        KVCacheSpecKind.UNKNOWN,
-    )
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        is_attention = get_kv_cache_spec_kind(spec) is not KVCacheSpecKind.MAMBA
+    else:
+        is_attention = isinstance(spec, AttentionSpec)
     if is_attention and not is_dcp_exempt_spec(spec):
         return spec.block_size * dcp_size
     return spec.block_size
@@ -145,6 +153,36 @@ def build_offloading_config(
             else sum(tensor.size for tensor in kv_cache_config.kv_cache_tensors)
         )
         worker_kv_bytes_per_block = total_gpu_kv_bytes // kv_cache_config.num_blocks
+
+    # The SharedOffloadRegion layout requires every process to agree on the
+    # region geometry (row stride, slot size, num_blocks), but this value is
+    # computed from the LOCAL kv_cache_tensors: under pipeline parallelism the
+    # stages carry different layer sets (and the scheduler process computes it
+    # from the whole model), so each PP stage derives a different region size.
+    # Whoever wins O_EXCL creates the file at its size and every process that
+    # expected more spins in _wait_for_file_size for the full 30s and kills
+    # the engine ("Timed out waiting for mmap file to reach N bytes"). Until
+    # the geometry is negotiated cross-process, deployments with PP > 1 must
+    # pin a uniform value: the MAX of every rank's computed value (each
+    # process logs it below). Smaller ranks' slots are tail-padded; padding is
+    # copied around but never interpreted, so it costs bytes, not correctness.
+    override = extra_config.get("worker_kv_bytes_per_block_override")
+    logger.info(
+        "offload worker_kv_bytes_per_block: computed=%d override=%s",
+        worker_kv_bytes_per_block,
+        override,
+    )
+    if override is not None and worker_kv_bytes_per_block > 0:
+        override = int(override)
+        if override < worker_kv_bytes_per_block:
+            raise ValueError(
+                f"worker_kv_bytes_per_block_override={override} is smaller "
+                f"than this process's computed value "
+                f"{worker_kv_bytes_per_block}; the slot would overflow and "
+                f"corrupt neighboring workers' KV. Set it to the MAX of the "
+                f"computed= values every process logs at startup."
+            )
+        worker_kv_bytes_per_block = override
 
     single_group_spec = (
         kv_cache_config.kv_cache_groups[0].kv_cache_spec
